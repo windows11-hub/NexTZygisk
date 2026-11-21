@@ -5,6 +5,8 @@
 
 #include <linux/un.h>
 #include <sys/socket.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "logging.h"
 #include "misc.h"
@@ -14,6 +16,30 @@
 
 #define SOCKET_FILE_NAME LP_SELECT("cp32", "cp64") ".sock"
 
+/* INFO: Connect to the daemon without ever blocking the caller for long.
+
+           This function is called from inside the Zygote fork path
+             (rezygiskd_get_process_flags), so every millisecond spent here delays
+             the app being started - and, when it happens during boot, delays
+             services that come up from init as well.
+
+           The upstream version sleeps a full second between connection attempts:
+             on a boot where the daemon socket is not listening yet, every app
+             launch paid that penalty. That is what produced the "storage
+             temporarily unavailable" reports: the storage service and the app
+             that queries it were both pushed behind those sleeps.
+
+           Changes:
+             - no sleep between attempts; a retry is only useful if the daemon
+               came up in the meantime, which a 1s sleep cannot influence;
+             - the retry loop uses short yields instead, capped at ~50ms total;
+             - a connect/send/recv timeout is installed on the socket so a daemon
+               that accepts but never answers cannot block us forever.
+
+           On failure every caller already treats the result as "daemon not
+             available" and falls back to safe defaults, so returning quickly is
+             strictly better than waiting.
+*/
 static int rezygiskd_connect(uint8_t retry) {
   struct sockaddr_un addr = {
     .sun_family = AF_UNIX,
@@ -27,8 +53,11 @@ static int rezygiskd_connect(uint8_t retry) {
   */
   strcpy(addr.sun_path, TMP_PATH "/" SOCKET_FILE_NAME);
 
-  retry++;
-  while (--retry) {
+  /* INFO: Bound every retry attempt. 5 attempts x 10ms = 50ms worst case. */
+  if (retry == 0) retry = 1;
+  if (retry > 5) retry = 5;
+
+  for (uint8_t attempt = 0; attempt < retry; attempt++) {
     int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == -1) {
       PLOGE("socket");
@@ -36,21 +65,33 @@ static int rezygiskd_connect(uint8_t retry) {
       return -1;
     }
 
+    /* INFO: Never block indefinitely on a daemon that accepted but stopped
+               talking. 100ms is far longer than any valid reply needs. */
+    struct timeval tv = {
+      .tv_sec = 0,
+      .tv_usec = 100000
+    };
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     int ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-    if (ret == -1) {
-      PLOGE("connect (retry: %d)", retry);
+    if (ret == 0) return fd;
 
-      close(fd);
+    PLOGE("connect (attempt %u/%u)", (unsigned)attempt + 1, (unsigned)retry);
 
-      if (retry == 1) return -1;
+    close(fd);
 
-      sleep(1);
+    /* INFO: Do not sleep: this runs in the Zygote fork path. A short yield just
+               gives a daemon that is starting up a chance to finish binding. */
+    if (attempt + 1 < retry) {
+      struct timespec ts = {
+        .tv_sec = 0,
+        .tv_nsec = 10000000 /* 10ms */
+      };
 
-      /* INFO: Try again with a new socket; fd is closed here. */
-      continue;
+      nanosleep(&ts, NULL);
     }
-
-    return fd;
   }
 
   return -1;
