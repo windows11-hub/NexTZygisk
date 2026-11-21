@@ -65,11 +65,25 @@ static int rezygiskd_connect(uint8_t retry) {
       return -1;
     }
 
-    /* INFO: Never block indefinitely on a daemon that accepted but stopped
-               talking. 100ms is far longer than any valid reply needs. */
+    /* INFO: Bound the wait, but generously.
+
+           100ms was too tight. This socket serves every RPC the loader makes,
+             not just the per-fork GetProcessFlags query: loading LSPosed walks
+             rezygiskd_read_modules() (one read_string per module) and
+             rezygiskd_get_module_dir() (an SCM_RIGHTS fd), and the daemon side of
+             those calls does real work (csoloader_load, opening module dirs). A
+             100ms SO_RCVTIMEO cut those replies off mid-transfer, so the module
+             list came back truncated and LSPosed never got its data - no
+             parasitic window, and its manager could not enumerate modules.
+
+           2s is still bounded (a wedged daemon cannot hang the caller forever)
+             but leaves ample room for the slow RPCs. The tight bound that matters
+             is the one on connect attempts above, which is what the Zygote fork
+             path actually pays.
+    */
     struct timeval tv = {
-      .tv_sec = 0,
-      .tv_usec = 100000
+      .tv_sec = 2,
+      .tv_usec = 0
     };
 
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
