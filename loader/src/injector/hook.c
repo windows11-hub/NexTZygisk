@@ -385,7 +385,7 @@ DCL_HOOK_FUNC(char *, strdup, const char *str) {
   return old_strdup(str);
 }
 
-static void hook_unloader(void);
+static bool hook_unloader(void);
 /*
   INFO: Our goal is to get called after libart.so is loaded, but before ART actually starts running.
           If we are too early, we won't find libart.so in maps, and if we are too late, we could make other
@@ -416,15 +416,17 @@ DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *defau
              window never appeared and its settings app could not read the module
              list.
 
-           A one-shot flag matches what the comment describes and keeps the hook
-             in place for the single transition we actually need.
+           The latch is set only after hook_unloader() reports success. Latching
+             first and then calling (the previous attempt at this fix) was wrong:
+             hook_unloader() bails out when libart.so is not mapped yet, which is
+             the normal case for the earliest property reads, and the flag then
+             prevented every later retry - Zygisk never loaded its modules at all,
+             which is why injection failed outright on some boots.
   */
   static bool art_setup_done = false;
 
-  if (!art_setup_done) {
+  if (!art_setup_done && hook_unloader()) {
     art_setup_done = true;
-
-    hook_unloader();
   }
 
   return old_property_get(key, value, default_value);
@@ -1543,11 +1545,21 @@ void hook_functions(void) {
   PLT_HOOK_REGISTER_SYM("libandroid_runtime.so", "_ZNK18FileDescriptorInfo14ReopenOrDetach", _ZNK18FileDescriptorInfo14ReopenOrDetach, true);
 }
 
-static void hook_unloader(void) {
+/* INFO: Returns true only when the libart transition really happened.
+
+           The caller must not latch itself on a failed attempt: this hook runs on
+             the first property read that happens after libandroid_runtime is
+             loaded, which may well be BEFORE libart.so is mapped. Upstream simply
+             ran the whole body on every call, so an early failure was retried on
+             the next property read.
+
+           Returning a status makes that retry explicit instead of accidental.
+*/
+static bool hook_unloader(void) {
   if (!plti_add_lib(&plti_ctx, "libart.so")) {
     LOGE("Failed to add libart.so to PLTI");
 
-    return;
+    return false;
   }
 
   PLT_HOOK_REGISTER("libart.so", pthread_attr_setstacksize, false);
@@ -1557,9 +1569,13 @@ static void hook_unloader(void) {
   /* INFO: Load modules early on (before system server fork) to spread through all Zygotes */
   if (!load_modules_only()) {
     LOGE("Failed to load modules in hook_unloader");
+
+    return false;
   }
 
   LOGD("ReZygisk unloader hooked successfully");
+
+  return true;
 }
 
 static void unhook_functions(void) {
