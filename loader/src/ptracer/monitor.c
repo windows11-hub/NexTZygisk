@@ -1413,6 +1413,32 @@ void init_monitor() {
     exit(1);
   }
 
+  /* INFO: Make sure init is actually running before we take over.
+
+           The stale monitor we killed above held PTRACE_SEIZE on init. If it was
+             killed while init was stopped for a fork event, init is left stopped
+             with no tracer: the release of the seize in the kernel does not
+             resume a tracee that was already in a ptrace-stop. init then never
+             continues, no service ever starts, and the device shows a black
+             screen.
+
+           This is why the black screen only appeared after a SOFT reboot: on a
+             cold boot there is no stale monitor, kill_stale_monitor() returns
+             immediately, and this window never exists.
+
+           Having just seized init ourselves we now own that stop, so continuing
+             it is both safe and necessary. We cannot tell reliably whether it was
+             stopped, and PTRACE_CONT on a running tracee is harmless, so it is
+             unconditional.
+  */
+  if (kill(1, 0) == 0) {
+    if (ptrace(PTRACE_CONT, 1, 0, 0) == -1 && errno != ESRCH) {
+      LOGW("PTRACE_CONT on init after stale-monitor takeover: %s", strerror(errno));
+    } else {
+      LOGI("Resumed init after taking over the tracer slot");
+    }
+  }
+
   monitor_events_init();
 
   if (!rezygiskd_listener_init()) {
