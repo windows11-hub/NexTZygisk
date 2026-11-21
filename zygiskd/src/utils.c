@@ -794,47 +794,6 @@ bool parse_mountinfo(const char *restrict pid, struct mountinfos *restrict mount
   return true;
 }
 
-/* INFO: Reads the user's extra umount paths (CUSTOM_UMOUNT_LIST_FILE). Returns how many
-           were read; each entry must be freed by the caller. A missing file is not an error. */
-static size_t read_custom_umount_list(char **paths, size_t max) {
-  FILE *list = fopen(CUSTOM_UMOUNT_LIST_FILE, "r");
-  if (!list) return 0;
-
-  size_t count = 0;
-  char line[PATH_MAX];
-  while (count < max && fgets(line, sizeof(line), list)) {
-    char *start = line;
-    while (*start == ' ' || *start == '\t') start++;
-
-    char *end = start + strlen(start);
-    while (end > start && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
-    *end = '\0';
-
-    /* INFO: Only absolute paths; empty lines and comments are skipped. */
-    if (*start != '/') continue;
-
-    paths[count] = strdup(start);
-    if (paths[count] == NULL) break;
-
-    count++;
-  }
-
-  fclose(list);
-
-  return count;
-}
-
-/* INFO: true when target is one of the listed paths or below one of them. */
-static bool is_custom_umount_target(const char *target, char **paths, size_t count) {
-  for (size_t i = 0; i < count; i++) {
-    size_t len = strlen(paths[i]);
-    if (strncmp(target, paths[i], len) != 0) continue;
-
-    if (target[len] == '\0' || target[len] == '/') return true;
-  }
-
-  return false;
-}
 
 bool umount_root(struct root_impl impl) {
   /* INFO: Unmounting is DISABLED in this fork.
@@ -863,6 +822,12 @@ bool umount_root(struct root_impl impl) {
 }
 
 int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl impl) {
+  /* INFO: Unmounting is disabled in this fork (see umount_root), so the root
+             impl is no longer consulted here; keep the parameter for ABI/API
+             stability and silence -Wunused-parameter, which the build promotes
+             to an error (-Werror).
+  */
+  (void)impl;
   static int clean_namespace_fd = -1;
   static int mounted_namespace_fd = -1;
 
