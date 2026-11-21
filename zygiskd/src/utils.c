@@ -822,14 +822,17 @@ bool umount_root(struct root_impl impl) {
 }
 
 int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl impl) {
-  /* INFO: Unmounting is disabled in this fork (see umount_root), so the root
-             impl is no longer consulted here; keep the parameter for ABI/API
-             stability and silence -Wunused-parameter, which the build promotes
-             to an error (-Werror).
-  */
-  (void)impl;
   static int clean_namespace_fd = -1;
   static int mounted_namespace_fd = -1;
+
+  /* INFO: Unmounting is disabled in this fork (see umount_root), so the root
+             impl is no longer consulted here. The parameter is kept for API
+             stability and cast to void to silence -Wunused-parameter, which
+             the build promotes to an error (-Werror). Declared after the
+             declarations above so -Wpedantic does not complain about a
+             statement preceding a declaration.
+  */
+  (void)impl;
 
   if (mns_state == Clean && clean_namespace_fd != -1) return clean_namespace_fd;
   if (mns_state == Mounted && mounted_namespace_fd != -1) return mounted_namespace_fd;
