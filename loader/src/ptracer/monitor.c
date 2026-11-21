@@ -1374,6 +1374,60 @@ void init_monitor() {
 
   monitor_events_register_event(sigchld_listener_callback, sigchld_signal_fd, EPOLLIN | EPOLLET);
 
+  /* INFO: Start the daemon NOW, not on the first Zygote fork.
+
+           Upstream creates the daemon lazily from PRE_INJECT, i.e. the first time
+             a Zygote fork is seen. The daemon has real work to do before it can
+             answer (load modules from /data/adb/modules, probe the root
+             implementation, bind its socket), so for the whole of that window
+             every app launch called rezygiskd_get_process_flags() and found
+             nothing listening - which is exactly the "everything is slow right
+             after boot" symptom.
+
+           Starting it here moves that cost off the app-launch path entirely: by
+             the time the first fork arrives the socket is already accepting.
+             Failures are non-fatal; PRE_INJECT still calls ensure_daemon_created()
+             and will retry if this attempt did not survive.
+  */
+  bool daemon64_started = ensure_daemon_created(true);
+  bool daemon32_started = ensure_daemon_created(false);
+
+  if (daemon64_started) LOGI("Pre-started NextZygiskd64");
+  if (daemon32_started) LOGI("Pre-started NextZygiskd32");
+
+  /* INFO: Give the freshly started daemon a brief, bounded chance to bind.
+
+           Spawning it only helps if the socket is accepting by the time the first
+             app asks for its flags. We poll instead of sleeping a fixed amount so
+             a fast daemon costs us almost nothing, and we stop at 500ms so a
+             broken daemon cannot hold the monitor back - PRE_INJECT retries and
+             the caller falls back to safe defaults anyway.
+  */
+  if (daemon64_started || daemon32_started) {
+    for (int i = 0; i < 25; i++) {
+      struct rezygisk_info info = { 0 };
+
+      rezygiskd_get_info(&info);
+
+      bool ready = info.running;
+
+      free_rezygisk_info(&info);
+
+      if (ready) {
+        LOGI("NextZygiskd is accepting connections (after %d ms)", i * 20);
+
+        break;
+      }
+
+      struct timespec ts = {
+        .tv_sec = 0,
+        .tv_nsec = 20000000 /* 20ms */
+      };
+
+      nanosleep(&ts, NULL);
+    }
+  }
+
   monitor_events_loop();
 
   /* INFO: Once it stops the loop, we cannot access the epool data, so we
