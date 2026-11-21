@@ -37,8 +37,22 @@ create_sys_perm() {
 }
 
 export TMP_PATH=/data/adb/rezygisk
-rm -rf "$TMP_PATH"
 
+# INFO: Do NOT wipe the whole directory on every boot.
+#
+#   A soft reboot (setprop ctl.restart zygote / ksud's emulated soft reboot)
+#   re-runs this script while the monitor from the previous boot is still alive
+#   and still tracing init. Wiping TMP_PATH removed its control socket and its
+#   state file out from under it, and the fresh monitor then failed to bind -
+#   Zygisk stayed dead until a full reboot.
+#
+#   Only remove what must not survive: the previous state.json, so the dashboard
+#   never reports stale data from an earlier boot. The socket is left alone; a
+#   live monitor keeps it, and a dead one leaves a stale file that bind() will
+#   simply replace after the monitor unlinks it at startup.
+rm -f "$TMP_PATH/state.json"
+
+mkdir -p "$TMP_PATH"
 create_sys_perm $TMP_PATH
 
 # INFO: We need to cleanup the module.prop to its default state before ReZygisk writes to it
