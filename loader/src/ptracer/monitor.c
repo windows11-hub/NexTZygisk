@@ -1,11 +1,9 @@
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <errno.h>
-#include <signal.h>
-#include <dirent.h>
 
+#include <dirent.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -153,25 +151,9 @@ bool rezygiskd_listener_init() {
 
   size_t sun_path_len = sprintf(addr.sun_path, "%s/%s", rezygiskd_get_path(), SOCKET_NAME);
 
-  /* INFO: This is a filesystem socket, not an abstract one, so a stale file
-             left by a previous boot (or by a previous monitor that was killed)
-             makes bind() fail with EADDRINUSE - and the monitor then exits
-             without ever writing state.json, which is exactly the
-             "Daemon: not running / connect refused (111)" breakdown.
-
-           Unlinking first is safe: if a live monitor owns the socket we never
-           reach this point, because init_monitor() bails out earlier when it
-           sees a running monitor. A subsequent bind() would then fail with
-           ECONNREFUSED for clients, which is what the leftover file caused.
-  */
-  unlink(addr.sun_path);
-
   socklen_t socklen = sizeof(sa_family_t) + sun_path_len;
   if (bind(monitor_sock_fd, (struct sockaddr *)&addr, socklen) == -1) {
     PLOGE("bind socket");
-
-    close(monitor_sock_fd);
-    monitor_sock_fd = -1;
 
     return false;
   }
@@ -302,7 +284,7 @@ void rezygiskd_listener_callback() {
       }
       case DAEMON64_SET_INFO:
       case DAEMON32_SET_INFO: {
-        const char *daemon_name = (msg->cmd == DAEMON64_SET_INFO ? "NextZygiskd64" : "NextZygiskd32");
+        const char *daemon_name = (msg->cmd == DAEMON64_SET_INFO ? "ReZygiskd64" : "ReZygiskd32");
 
         LOGD("Received %s info", daemon_name);
 
@@ -396,7 +378,7 @@ void rezygiskd_listener_callback() {
       }
       case DAEMON64_SET_ERROR_INFO:
       case DAEMON32_SET_ERROR_INFO: {
-        const char *daemon_name = (msg->cmd == DAEMON64_SET_ERROR_INFO ? "NextZygiskd64" : "NextZygiskd32");
+        const char *daemon_name = (msg->cmd == DAEMON64_SET_ERROR_INFO ? "ReZygiskd64" : "ReZygiskd32");
 
         LOGD("Received %s error info", daemon_name);
 
@@ -437,20 +419,6 @@ void rezygiskd_listener_stop() {
   monitor_sock_fd = -1;
 }
 
-/* INFO: Raised for soft reboot support.
-
-         The original limit was 5 zygote starts within 30 seconds before the
-         monitor declared "Zygote crashed" and stopped injecting until the next
-         hard reboot. A soft reboot (setprop ctl.restart zygote, or ksud's
-         emulated soft reboot) restarts Zygote several times in quick
-         succession, which tripped the counter and left Zygisk dead until a
-         full reboot - the "soft reboot loses zygisk" bug.
-
-         A genuine crash loop still needs a stop condition, so the count is
-         kept but the window and the ceiling are both widened: up to 40 starts
-         within 30 seconds. Real crash loops hit that in under a second, while
-         a soft reboot (3-6 restarts) stays far below it.
-*/
 #define MAX_RETRY_COUNT 40
 
 #define CREATE_ZYGOTE_START_COUNTER(abi)             \
@@ -526,8 +494,6 @@ static bool ensure_daemon_created(bool is_64bit) {
       }                                                           \
     }                                                             \
                                                                   \
-    update_status(NULL);                                          \
-                                                                  \
     continue;                                                     \
   }
 
@@ -554,44 +520,12 @@ static bool ensure_daemon_created(bool is_64bit) {
       LOGW("ReZygiskd " #abi "-bit not running, stop injecting");     \
                                                                       \
       tracing_state = STOPPING;                                       \
-      monitor_stop_reason = "NextZygiskd not running";                  \
+      monitor_stop_reason = "ReZygiskd not running";                  \
       ptrace(PTRACE_INTERRUPT, 1, 0, 0);                              \
                                                                       \
       break;                                                          \
     }                                                                 \
   }
-
-/* INFO: Vendor (ColorOS / OxygenOS) Zygote.
-
-           stock Android execs /system/bin/app_process64, and PRE_INJECT above
-           matches that exact path. OPPO's ColorOS instead runs a second Zygote
-           called "zygote_ocomp" (seen in the field as
-           /system/bin/zygote_ocomp64 or a vendor-private path), whose
-           /proc/<pid>/exe therefore does not match APP_PROCESS_64/32. Without
-           this branch tracer stayed NULL for every process, so the monitor
-           started, seized init and then silently injected nothing - the build
-           "installs but does nothing" symptom.
-
-           We match on the basename so any vendor prefix or suffix is covered,
-           and keep the same abi/daemon guards as the stock branches.
-*/
-static bool is_vendor_zygote(const char *program, bool *is_64bit) {
-  const char *base = strrchr(program, '/');
-  base = base ? base + 1 : program;
-
-  /* INFO: Only the vendor Zygote names we know; a plain "zygote" is not a
-             Zygote here (it is the launcher that forks app_process). */
-  if (strncmp(base, "zygote_ocomp", 12) != 0 &&
-      strncmp(base, "zygote_oplus", 12) != 0) {
-    return false;
-  }
-
-  /* INFO: A bare name is 64-bit on every ABI this build targets; an explicit
-             "32" suffix means the 32-bit Zygote. */
-  *is_64bit = !(strstr(base, "32") != NULL);
-
-  return true;
-}
 
 #define PRE_INJECT_TANGO                                           \
   if (strcmp(program, "/system_ext/bin/tango_translator") == 0) {  \
@@ -612,7 +546,7 @@ static bool is_vendor_zygote(const char *program, bool *is_64bit) {
       LOGW("ReZygiskd 32-bit not running, stop injecting");        \
                                                                    \
       tracing_state = STOPPING;                                    \
-      monitor_stop_reason = "NextZygiskd not running";               \
+      monitor_stop_reason = "ReZygiskd not running";               \
       ptrace(PTRACE_INTERRUPT, 1, 0, 0);                           \
                                                                    \
       break;                                                       \
@@ -635,7 +569,7 @@ static bool claim_init_tracer() {
     if (errno == EPERM) {
       LOGW("Another process is already tracing init");
 
-      update_status("Multiple Zygisks functioning");
+      update_status(" Multiple Zygisks functioning");
     } else {
       PLOGE("failed to seize init");
     }
@@ -695,11 +629,8 @@ void sigchld_listener_callback() {
     int pid;
     while ((pid = waitpid(-1, &sigchld_status, __WALL | WNOHANG)) != 0) {
       if (pid == -1) {
-        /* INFO: Never treat -1 as a process: with no children left (ECHILD) this
-                   would spin forever. The next SIGCHLD brings us back here. */
-        if (errno != ECHILD) PLOGE("waitpid");
-
-        break;
+        if (tracing_state == STOPPED && errno == ECHILD) break;
+        PLOGE("waitpid");
       }
 
       if (pid == 1) {
@@ -803,43 +734,6 @@ void sigchld_listener_callback() {
             PRE_INJECT(32, false)
             PRE_INJECT_TANGO
 
-            /* INFO: Vendor (ColorOS) Zygote, matched by basename.
-                       Stock app_process64 never appears on those builds, so
-                       without this the monitor seized init and injected
-                       nothing at all. */
-            if (tracer == NULL) {
-              bool vendor_is_64 = true;
-
-              if (is_vendor_zygote(program, &vendor_is_64)) {
-                bool abi_key = vendor_is_64;
-
-                tracer = abi_key ? "./bin/zygisk-ptrace64" : "./bin/zygisk-ptrace32";
-                is_tango = false;
-
-                LOGI("Vendor zygote detected (%s, 64-bit: %s)", program, abi_key ? "yes" : "no");
-
-                if (abi_key ? should_stop_inject64() : should_stop_inject32()) {
-                  LOGW("Vendor zygote restart too many times, stop injecting");
-
-                  tracing_state = STOPPING;
-                  monitor_stop_reason = "Zygote crashed";
-                  ptrace(PTRACE_INTERRUPT, 1, 0, 0);
-
-                  break;
-                }
-
-                if (!ensure_daemon_created(abi_key)) {
-                  LOGW("NextZygiskd not running, stop injecting");
-
-                  tracing_state = STOPPING;
-                  monitor_stop_reason = "NextZygiskd not running";
-                  ptrace(PTRACE_INTERRUPT, 1, 0, 0);
-
-                  break;
-                }
-              }
-            }
-
             if (tracer != NULL) {
               LOGD("Stopping %d (program: %s, tracer: %s, tango: %s)", pid, program, tracer, is_tango ? "yes" : "no");
 
@@ -930,68 +824,25 @@ void sigchld_listener_stop() {
 static char pre_section[1024];
 static char post_section[1024];
 
-#define WRITE_STATUS_ABI(suffix)                                                             \
-  if (status ## suffix.supported) {                                                          \
-    strlcat(status_text, ", NextZygisk " # suffix "-bit: ", sizeof(status_text));              \
-                                                                                             \
-    if (tracing_state != TRACING) strlcat(status_text, "[FAIL]", sizeof(status_text));           \
-    else if (status ## suffix.zygote_injected && status ## suffix.daemon_running)            \
-      strlcat(status_text, "[OK]", sizeof(status_text));                                       \
-    else strlcat(status_text, "[WARN]", sizeof(status_text));                                    \
-                                                                                             \
-    if (!status ## suffix.daemon_running) {                                                  \
-      if (status ## suffix.daemon_error_info) {                                              \
-        strlcat(status_text, "(NextZygiskd: ", sizeof(status_text));                           \
-        strlcat(status_text, status ## suffix.daemon_error_info, sizeof(status_text));       \
-        strlcat(status_text, ")", sizeof(status_text));                                      \
-      } else {                                                                               \
-        strlcat(status_text, "(NextZygiskd: not running)", sizeof(status_text));               \
-      }                                                                                      \
-    }                                                                                        \
+#define WRITE_STATUS_ABI(suffix)                                                     \
+  if (status ## suffix.supported) {                                                  \
+    strcat(status_text, ", ReZygisk " # suffix "-bit: ");                            \
+                                                                                     \
+    if (tracing_state != TRACING) strcat(status_text, "[FAIL]");                         \
+    else if (status ## suffix.zygote_injected && status ## suffix.daemon_running)    \
+      strcat(status_text, "[OK]");                                                     \
+    else strcat(status_text, "[WARN]");                                                  \
+                                                                                     \
+    if (!status ## suffix.daemon_running) {                                          \
+      if (status ## suffix.daemon_error_info) {                                      \
+        strcat(status_text, "(ReZygiskd: ");                                         \
+        strcat(status_text, status ## suffix.daemon_error_info);                     \
+        strcat(status_text, ")");                                                    \
+      } else {                                                                       \
+        strcat(status_text, "(ReZygiskd: not running)");                             \
+      }                                                                              \
+    }                                                                                \
   }
-
-/* INFO: Writes a JSON string literal, escaping what could break the document. */
-static void write_json_string(FILE *json, const char *str) {
-  fputc('"', json);
-
-  for (const unsigned char *c = (const unsigned char *)str; *c; c++) {
-    switch (*c) {
-      case '"': fputs("\\\"", json); break;
-      case '\\': fputs("\\\\", json); break;
-      case '\n': fputs("\\n", json); break;
-      case '\r': fputs("\\r", json); break;
-      case '\t': fputs("\\t", json); break;
-      default: {
-        if (*c < 0x20) fprintf(json, "\\u%04x", *c);
-        else fputc(*c, json);
-      }
-    }
-  }
-
-  fputc('"', json);
-}
-
-static void write_json_daemon(FILE *json, const char *abi, struct rezygiskd_status *status, char **modules, uint32_t modules_len) {
-  fprintf(json, "    \"%s\": {\n", abi);
-  fprintf(json, "      \"state\": %d,\n", status->daemon_running);
-  if (status->daemon_error_info) {
-    fprintf(json, "      \"reason\": ");
-    write_json_string(json, status->daemon_error_info);
-    fprintf(json, ",\n");
-  }
-  fprintf(json, "      \"modules\": [");
-
-  if (modules) for (uint32_t i = 0; i < modules_len; i++) {
-    if (i > 0) fprintf(json, ", ");
-    write_json_string(json, modules[i]);
-  }
-
-  fprintf(json, "]\n");
-  fprintf(json, "    }");
-}
-
-#define STATE_JSON_PATH "/data/adb/rezygisk/state.json"
-#define STATE_JSON_TMP_PATH STATE_JSON_PATH ".tmp"
 
 static bool update_status(const char *message) {
   FILE *prop = fopen("/data/adb/modules/rezygisk/module.prop", "w");
@@ -1008,21 +859,21 @@ static bool update_status(const char *message) {
     return true;
   }
 
-  char status_text[512] = "Monitor: ";
+  char status_text[256] = "Monitor: ";
   switch (tracing_state) {
     case TRACING: {
-      strlcat(status_text, "[OK]", sizeof(status_text));
+      strcat(status_text, "[OK]");
 
       break;
     }
     case STOPPING: [[fallthrough]];
     case STOPPED: {
-      strlcat(status_text, "[BLOCKED]", sizeof(status_text));
+      strcat(status_text, "[BLOCKED]");
 
       break;
     }
     case EXITING: {
-      strlcat(status_text, "[FAIL]", sizeof(status_text));
+      strcat(status_text, "[FAIL]");
 
       break;
     }
@@ -1035,9 +886,7 @@ static bool update_status(const char *message) {
   fclose(prop);
 
   if (environment_information64.root_impl || environment_information32.root_impl) {
-    /* INFO: Write to a temporary file and rename it, so readers (WebUI) never
-               see a truncated or half-written document. */
-    FILE *json = fopen(STATE_JSON_TMP_PATH, "w");
+    FILE *json = fopen("/data/adb/rezygisk/state.json", "w");
     if (json == NULL) {
       PLOGE("failed to open state.json");
 
@@ -1045,45 +894,62 @@ static bool update_status(const char *message) {
     }
 
     fprintf(json, "{\n");
-    fprintf(json, "  \"root\": ");
-    write_json_string(json, environment_information64.root_impl ? environment_information64.root_impl : environment_information32.root_impl);
-    fprintf(json, ",\n");
+    fprintf(json, "  \"root\": \"%s\",\n", environment_information64.root_impl ? environment_information64.root_impl : environment_information32.root_impl);
 
     fprintf(json, "  \"monitor\": {\n");
     fprintf(json, "    \"state\": \"%d\"", tracing_state);
-    if (monitor_stop_reason) {
-      fprintf(json, ",\n    \"reason\": ");
-      write_json_string(json, monitor_stop_reason);
-    }
-    fprintf(json, "\n");
+    if (monitor_stop_reason) fprintf(json, ",\n    \"reason\": \"%s\",\n", monitor_stop_reason);
+    else fprintf(json, "\n");
 
     if (status64.supported || status32.supported)
       fprintf(json, "  },\n");
     else
       fprintf(json, "  }\n");
 
+
     if (status64.supported || status32.supported) {
       fprintf(json, "  \"rezygiskd\": {\n");
       if (status64.supported) {
-        write_json_daemon(json, "64", &status64, environment_information64.modules, environment_information64.modules_len);
-        fprintf(json, status32.supported ? ",\n" : "\n");
+        fprintf(json, "    \"64\": {\n");
+        fprintf(json, "      \"state\": %d,\n", status64.daemon_running);
+        if (status64.daemon_error_info) fprintf(json, "      \"reason\": \"%s\",\n", status64.daemon_error_info);
+        fprintf(json, "      \"modules\": [");
+
+        if (environment_information64.modules) for (uint32_t i = 0; i < environment_information64.modules_len; i++) {
+          if (i > 0) fprintf(json, ", ");
+          fprintf(json, "\"%s\"", environment_information64.modules[i]);
+        }
+
+        fprintf(json, "]\n");
+        fprintf(json, "    }");
+        if (status32.supported) fprintf(json, ",\n");
+        else fprintf(json, "\n");
       }
 
       if (status32.supported) {
-        write_json_daemon(json, "32", &status32, environment_information32.modules, environment_information32.modules_len);
-        fprintf(json, "\n");
+        fprintf(json, "    \"32\": {\n");
+        fprintf(json, "      \"state\": %d,\n", status32.daemon_running);
+        if (status32.daemon_error_info) fprintf(json, "      \"reason\": \"%s\",\n", status32.daemon_error_info);
+        fprintf(json, "      \"modules\": [");
+
+        if (environment_information32.modules) for (uint32_t i = 0; i < environment_information32.modules_len; i++) {
+          if (i > 0) fprintf(json, ", ");
+          fprintf(json, "\"%s\"", environment_information32.modules[i]);
+        }
+
+        fprintf(json, "]\n");
+        fprintf(json, "    }\n");
       }
 
       fprintf(json, "  },\n");
 
-      /* INFO: Always report every supported ABI, so a non-injected 32-bit
-                 Zygote is shown as such instead of silently missing. */
       fprintf(json, "  \"zygote\": {\n");
       if (status64.supported) {
         fprintf(json, "    \"64\": %d", status64.zygote_injected);
-        fprintf(json, status32.supported ? ",\n" : "\n");
+        if (status32.supported && status32.zygote_injected) fprintf(json, ",\n");
+        else fprintf(json, "\n");
       }
-      if (status32.supported) {
+      if (status32.supported && status32.zygote_injected) {
         fprintf(json, "    \"32\": %d\n", status32.zygote_injected);
       }
       fprintf(json, "  }\n");
@@ -1091,21 +957,9 @@ static bool update_status(const char *message) {
 
     fprintf(json, "}\n");
 
-    if (fclose(json) == EOF) {
-      PLOGE("failed to write state.json");
-      unlink(STATE_JSON_TMP_PATH);
-
-      return false;
-    }
-
-    if (rename(STATE_JSON_TMP_PATH, STATE_JSON_PATH) == -1) {
-      PLOGE("failed to rename state.json");
-      unlink(STATE_JSON_TMP_PATH);
-
-      return false;
-    }
+    fclose(json);
   } else {
-    if (remove(STATE_JSON_PATH) == -1 && errno != ENOENT) {
+    if (remove("/data/adb/rezygisk/state.json") == -1) {
       PLOGE("failed to remove state.json");
     }
   }
@@ -1128,15 +982,15 @@ static bool prepare_environment() {
   char line[1024];
   while (fgets(line, sizeof(line), orig_prop) != NULL) {
     if (strncmp(line, "description=", strlen("description=")) == 0) {
-      strlcat(pre_section, "description=", sizeof(pre_section));
-      strlcat(post_section, line + strlen("description="), sizeof(post_section));
+      strcat(pre_section, "description=");
+      strcat(post_section, line + strlen("description="));
       after_description = true;
 
       continue;
     }
 
-    if (after_description) strlcat(post_section, line, sizeof(post_section));
-    else strlcat(pre_section, line, sizeof(pre_section));
+    if (after_description) strcat(post_section, line);
+    else strcat(pre_section, line);
   }
 
   fclose(orig_prop);
@@ -1144,136 +998,23 @@ static bool prepare_environment() {
   return true;
 }
 
-/* INFO: Single-instance guard.
+/* INFO: Terminate a monitor left over from a previous boot.
 
-           A soft reboot re-runs post-fs-data.sh while the monitor from the
-           previous boot is still alive and still holding the ptrace seize on
-           init. Without this check the new monitor would start, fail to seize
-           init (EPERM), print "Multiple Zygisks functioning" and exit - and the
-           old monitor, whose helper daemons were just replaced, ends up in a
-           broken state. The result was "soft reboot loses Zygisk".
+           Without this, a soft reboot (restarting Zygote instead of the whole
+             device) leaves the old monitor alive. It still holds PTRACE_SEIZE on
+             init, so our own claim_init_tracer() fails with EPERM and upstream
+             simply exit(1)s - which is precisely why Zygisk disappeared after a
+             soft reboot and only a hard reboot brought it back.
 
-           The pid file makes the second start a no-op instead: if the recorded
-           monitor is still alive, the new process exits immediately and leaves
-           the running one (and its injection state) untouched.
-*/
-/* INFO: Does this device actually run a 32-bit Zygote?
+           The old monitor is useless after a Zygote restart in any case: the
+             Zygote it was watching is gone, and its per-ABI restart counters and
+             daemon pids all refer to dead processes.
 
-           Two independent signals, cheapest first:
-             1. ro.zygote says which Zygotes init starts ("zygote64", "zygote",
-                "zygote64_32", "zygote_32_64"). This build only needs the
-                32-bit daemon when that string mentions a 32-bit variant.
-             2. As a fallback, look for a 32-bit app_process32 on disk.
-
-           Reading the property through __system_property_get avoids spawning a
-             process on the boot path. utils.c already declares that symbol.
-*/
-extern int __system_property_get(const char *, char *);
-
-static bool device_has_32bit_runtime(void) {
-  /* INFO: PROP_VALUE_MAX is 92 on Android, but pulling in
-             cutils/properties.h for it would add an Android-private dependency
-             to a loader that currently builds with only libc headers. A fixed
-             buffer comfortably larger than any ro.zygote value keeps this
-             self-contained. */
-  char zygote_prop[128] = { 0 };
-
-  if (__system_property_get("ro.zygote", zygote_prop) > 0) {
-    /* INFO: "zygote64" is 64-bit only; anything mentioning 32 alongside it
-               ("zygote64_32", "zygote_32_64") does start a 32-bit Zygote. */
-    if (strstr(zygote_prop, "32") != NULL) return true;
-
-    if (strcmp(zygote_prop, "zygote64") == 0) return false;
-  }
-
-  /* INFO: Fallback for ROMs that do not set ro.zygote usefully. */
-  return access("/system/bin/app_process32", F_OK) == 0;
-}
-
-/* INFO: Find every live zygisk-ptrace monitor except ourselves.
-
-           The pid file is written on every start, but it is not authoritative:
-           post-fs-data.sh wipes TMP_PATH, and a monitor killed hard leaves a
-           stale or missing record. Scanning /proc by cmdline is the reliable
-           way to catch one that is still holding PTRACE_SEIZE on init.
-*/
-static size_t find_live_monitors(pid_t *out, size_t max) {
-  DIR *proc = opendir("/proc");
-  if (!proc) return 0;
-
-  size_t count = 0;
-  pid_t self = getpid();
-
-  struct dirent *entry;
-  while (count < max && (entry = readdir(proc)) != NULL) {
-    char *end = NULL;
-    long pid = strtol(entry->d_name, &end, 10);
-
-    if (pid <= 0 || end == NULL || *end != '\0') continue;
-    if ((pid_t)pid == self) continue;
-
-    char cmdline_path[PATH_MAX];
-    snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%ld/cmdline", pid);
-
-    FILE *f = fopen(cmdline_path, "r");
-    if (!f) continue;
-
-    char cmdline[PATH_MAX] = { 0 };
-    size_t got = fread(cmdline, 1, sizeof(cmdline) - 1, f);
-    fclose(f);
-
-    if (got == 0) continue;
-
-    if (strstr(cmdline, "zygisk-ptrace") != NULL && strstr(cmdline, "monitor") != NULL) {
-      out[count++] = (pid_t)pid;
-    }
-  }
-
-  closedir(proc);
-
-  return count;
-}
-
-/* INFO: Make sure no monitor from a previous boot survives us.
-
-           A monitor is only meaningful for the Zygote tree it seized. After a
-           soft reboot (or a Zygote crash) the old monitor is still alive and
-           still holds PTRACE_SEIZE on init, but it watches a Zygote that no
-           longer exists: its restart counters are stale, its daemon pids are
-           stale, and its injection targets are gone. Leaving it in place means
-           the new monitor cannot seize init (EPERM) and the old one never
-           injects the new Zygote - Zygisk appears completely dead.
-
-           So the old one must be killed, not tolerated. We stop it, then kill
-           it, and wait for it to disappear before continuing.
-*/
-/* INFO: Terminate one process and wait until the kernel has reaped it.
-
-           Waiting matters: the ptrace seize on init is released by the kernel
-           when the tracer exits, not when the signal is delivered. If we seize
-           init too early the call fails with EPERM and we would wrongly conclude
-           that another tracer owns it.
-*/
-/* INFO: Terminate a stale monitor and wait until it is really gone.
-
-           Why the wait is mandatory and why the signal choice matters:
-
-           The stale monitor holds PTRACE_SEIZE on init. When it exits, the kernel
-             releases that seize in __ptrace_unlink, and any fork event that was
-             already pending for init is dropped. If we call claim_init_tracer()
-             before that release is complete we get EPERM, and if init was stopped
-             for a fork event when its tracer vanished it can be left in a state
-             where nobody continues it - which on this platform shows up as the
-             screen never coming up after a soft reboot.
-
-           SIGTERM first is deliberate: a monitor between events runs its own
-             PTRACE_DETACH path and releases init cleanly. SIGKILL is only the
-             fallback, and even then we poll until the pid is gone so the seize is
-             definitely released before we try to take it ourselves.
-
-           A zombie would keep the tracee relationship alive until reaped, so we
-             also treat our own unreaped child as "still there" and keep waiting;
-             the pid only counts as gone on ESRCH.
+           Killing it releases the seize. Because init may be sitting in a
+             ptrace-stop at that moment (killed mid fork event), the seize release
+             alone does not resume it, so we resume it explicitly once we hold the
+             tracer slot ourselves. Skipping that step is what makes a dirty
+             handoff hang init and leave the screen black.
 */
 static void terminate_and_wait(pid_t pid, const char *what) {
   if (kill(pid, SIGTERM) == -1 && errno == ESRCH) return;
@@ -1305,137 +1046,78 @@ static void terminate_and_wait(pid_t pid, const char *what) {
   LOGE("%s (pid %d) survived SIGKILL", what, (int)pid);
 }
 
-/* INFO: Make sure no monitor from a previous boot survives us.
+/* INFO: Find every process that looks like a monitor of ours.
 
-           A monitor only means something for the Zygote tree it seized. After a
-           soft reboot (or a Zygote crash) the old monitor is still alive and
-           still holds PTRACE_SEIZE on init, but the Zygote it was watching is
-           gone: its restart counters are stale, its daemon pids are stale, its
-           injection targets no longer exist. Tolerating it - which is what the
-           first version of this guard did - means the new monitor cannot seize
-           init (EPERM) and the old one never injects the new Zygote, so Zygisk
-           looks completely dead until a hard reboot.
-
-           So it is replaced, not respected. Both the pid file and a /proc scan
-           are consulted: the pid file is what we write, but post-fs-data.sh
-           wipes TMP_PATH and a hard-killed monitor leaves nothing behind, so the
-           scan is what actually guarantees we find it.
+           Upstream never records its pid anywhere, so a pid file cannot be the
+             source. Scanning /proc/<pid>/cmdline is reliable: a monitor is
+             always the same binary with the "monitor" argument, while the
+             injection helper runs the same binary with "trace <pid>".
 */
-static void kill_stale_monitor() {
-  pid_t victims[8];
+static size_t find_live_monitors(pid_t *out, size_t max) {
+  DIR *proc = opendir("/proc");
+  if (!proc) return 0;
+
   size_t count = 0;
+  pid_t self = getpid();
 
-  /* INFO: Primary source: the pid recorded by the previous start. */
-  char pid_path[PATH_MAX];
-  snprintf(pid_path, sizeof(pid_path), "%s/monitor.pid", rezygiskd_get_path());
+  struct dirent *entry;
+  while (count < max && (entry = readdir(proc)) != NULL) {
+    char *end = NULL;
+    long pid = strtol(entry->d_name, &end, 10);
 
-  FILE *f = fopen(pid_path, "r");
-  if (f) {
-    long old_pid = -1;
+    if (pid <= 0 || end == NULL || *end != '\0') continue;
+    if ((pid_t)pid == self) continue;
 
-    if (fscanf(f, "%ld", &old_pid) == 1 && old_pid > 0 && old_pid != (long)getpid()) {
-      victims[count++] = (pid_t)old_pid;
-    }
+    char cmdline_path[PATH_MAX];
+    snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%ld/cmdline", pid);
 
+    FILE *f = fopen(cmdline_path, "r");
+    if (!f) continue;
+
+    char cmdline[PATH_MAX] = { 0 };
+    size_t got = fread(cmdline, 1, sizeof(cmdline) - 1, f);
     fclose(f);
-  }
 
-  /* INFO: Fallback: everything that looks like a monitor. Covers the case where
-             the pid file is missing or stale. */
-  pid_t scanned[8];
-  size_t scanned_count = find_live_monitors(scanned, 8);
+    if (got == 0) continue;
 
-  for (size_t i = 0; i < scanned_count && count < 8; i++) {
-    bool dup = false;
-
-    for (size_t j = 0; j < count; j++) {
-      if (victims[j] == scanned[i]) {
-        dup = true;
-
-        break;
-      }
+    /* INFO: "zygisk-ptrace64 monitor" matches; "zygisk-ptrace64 trace 123" does
+               not, because it has no "monitor" argument. */
+    if (strstr(cmdline, "zygisk-ptrace") != NULL && strstr(cmdline, "monitor") != NULL) {
+      out[count++] = (pid_t)pid;
     }
-
-    if (!dup) victims[count++] = scanned[i];
   }
+
+  closedir(proc);
+
+  return count;
+}
+
+static void kill_stale_monitor(void) {
+  pid_t victims[8];
+  size_t count = find_live_monitors(victims, 8);
 
   for (size_t i = 0; i < count; i++) {
-    LOGW("Replacing stale monitor (pid %d) from a previous boot", (int)victims[i]);
+    LOGW("Replacing stale monitor (pid %d)", (int)victims[i]);
 
     terminate_and_wait(victims[i], "stale monitor");
   }
 }
 
-static void write_monitor_pid() {
-  char pid_path[PATH_MAX];
-  snprintf(pid_path, sizeof(pid_path), "%s/monitor.pid", rezygiskd_get_path());
-
-  FILE *f = fopen(pid_path, "w");
-  if (!f) {
-    PLOGE("failed to write monitor pid file");
-
-    return;
-  }
-
-  fprintf(f, "%d\n", getpid());
-  fclose(f);
-}
-
 void init_monitor() {
   LOGI("ReZygisk %s", ZKSU_VERSION);
 
-  /* INFO: Must run before prepare_environment(), which recreates TMP_PATH. A
-             monitor from a previous boot watches a dead Zygote tree and must be
-             replaced, not tolerated - see kill_stale_monitor().
-
-           Ordering note: killing the old monitor releases its PTRACE_SEIZE on
-             init, and for the moment between that release and our own seize init
-             runs with nobody watching its forks. Doing this as early as possible
-             keeps that unwatched window at the very start of our own startup
-             rather than interleaved with environment setup, which is why this
-             stays the first thing we do.
-  */
   kill_stale_monitor();
 
   if (!prepare_environment()) exit(1);
 
-  write_monitor_pid();
+  if (!claim_init_tracer()) exit(1);
 
-  if (!claim_init_tracer()) {
-    /* INFO: Another tracer got there first between our check and the seize.
-               Leave quietly rather than fighting over init. */
-    if (errno == EPERM) {
-      LOGW("init is already traced by someone else, exiting");
-
-      exit(0);
-    }
-
-    exit(1);
-  }
-
-  /* INFO: Make sure init is actually running before we take over.
-
-           The stale monitor we killed above held PTRACE_SEIZE on init. If it was
-             killed while init was stopped for a fork event, init is left stopped
-             with no tracer: the release of the seize in the kernel does not
-             resume a tracee that was already in a ptrace-stop. init then never
-             continues, no service ever starts, and the device shows a black
-             screen.
-
-           This is why the black screen only appeared after a SOFT reboot: on a
-             cold boot there is no stale monitor, kill_stale_monitor() returns
-             immediately, and this window never exists.
-
-           Having just seized init ourselves we now own that stop, so continuing
-             it is both safe and necessary. We cannot tell reliably whether it was
-             stopped, and PTRACE_CONT on a running tracee is harmless, so it is
-             unconditional.
-  */
+  /* INFO: init may have been left stopped when the stale monitor died mid fork
+             event. We now own the tracer slot, so resuming it is safe and
+             required - otherwise init never runs another service. */
   if (kill(1, 0) == 0) {
     if (ptrace(PTRACE_CONT, 1, 0, 0) == -1 && errno != ESRCH) {
-      LOGW("PTRACE_CONT on init after stale-monitor takeover: %s", strerror(errno));
-    } else {
-      LOGI("Resumed init after taking over the tracer slot");
+      LOGW("PTRACE_CONT on init after takeover: %s", strerror(errno));
     }
   }
 
@@ -1461,82 +1143,6 @@ void init_monitor() {
   }
 
   monitor_events_register_event(sigchld_listener_callback, sigchld_signal_fd, EPOLLIN | EPOLLET);
-
-  /* INFO: Start the daemon NOW, not on the first Zygote fork.
-
-           Upstream creates the daemon lazily from PRE_INJECT, i.e. the first time
-             a Zygote fork is seen. The daemon has real work to do before it can
-             answer (load modules from /data/adb/modules, probe the root
-             implementation, bind its socket), so for the whole of that window
-             every app launch called rezygiskd_get_process_flags() and found
-             nothing listening - which is exactly the "everything is slow right
-             after boot" symptom.
-
-           Starting it here moves that cost off the app-launch path entirely: by
-             the time the first fork arrives the socket is already accepting.
-             Failures are non-fatal; PRE_INJECT still calls ensure_daemon_created()
-             and will retry if this attempt did not survive.
-  */
-  bool daemon64_started = ensure_daemon_created(true);
-
-  if (daemon64_started) LOGI("Pre-started NextZygiskd64");
-
-  /* INFO: The 32-bit daemon is only pre-started when the device can run one.
-
-           bin/zygiskd32 is a 32-bit ELF. On an arm64-only build (empty
-             ro.product.cpu.abilist32, which is this target) execl() fails at once
-             and the child exits - but ensure_daemon_created() has already set
-             status32.daemon_running = true, so the monitor held a stale "running"
-             state for a dead process. The 32-bit injection path then behaved as if
-             a daemon were reachable and failed.
-
-           The 32-bit branch is only meaningful when a 32-bit Zygote exists. We
-             detect that from the same ABI property the boot script already uses to
-             choose between zygisk-ptrace64 and zygisk-ptrace32, and otherwise leave
-             status32 alone so its PRE_INJECT(32) branch never claims a daemon.
-  */
-  bool daemon32_started = false;
-
-  if (device_has_32bit_runtime()) {
-    daemon32_started = ensure_daemon_created(false);
-
-    if (daemon32_started) LOGI("Pre-started NextZygiskd32");
-  } else {
-    LOGI("No 32-bit runtime on this device, not starting NextZygiskd32");
-  }
-
-  /* INFO: Give the freshly started daemon a brief, bounded chance to bind.
-
-           Spawning it only helps if the socket is accepting by the time the first
-             app asks for its flags. We poll instead of sleeping a fixed amount so
-             a fast daemon costs us almost nothing, and we stop at 500ms so a
-             broken daemon cannot hold the monitor back - PRE_INJECT retries and
-             the caller falls back to safe defaults anyway.
-  */
-  if (daemon64_started || daemon32_started) {
-    for (int i = 0; i < 25; i++) {
-      struct rezygisk_info info = { 0 };
-
-      rezygiskd_get_info(&info);
-
-      bool ready = info.running;
-
-      free_rezygisk_info(&info);
-
-      if (ready) {
-        LOGI("NextZygiskd is accepting connections (after %d ms)", i * 20);
-
-        break;
-      }
-
-      struct timespec ts = {
-        .tv_sec = 0,
-        .tv_nsec = 20000000 /* 20ms */
-      };
-
-      nanosleep(&ts, NULL);
-    }
-  }
 
   monitor_events_loop();
 
