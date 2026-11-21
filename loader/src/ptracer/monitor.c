@@ -1254,10 +1254,31 @@ static size_t find_live_monitors(pid_t *out, size_t max) {
            init too early the call fails with EPERM and we would wrongly conclude
            that another tracer owns it.
 */
+/* INFO: Terminate a stale monitor and wait until it is really gone.
+
+           Why the wait is mandatory and why the signal choice matters:
+
+           The stale monitor holds PTRACE_SEIZE on init. When it exits, the kernel
+             releases that seize in __ptrace_unlink, and any fork event that was
+             already pending for init is dropped. If we call claim_init_tracer()
+             before that release is complete we get EPERM, and if init was stopped
+             for a fork event when its tracer vanished it can be left in a state
+             where nobody continues it - which on this platform shows up as the
+             screen never coming up after a soft reboot.
+
+           SIGTERM first is deliberate: a monitor between events runs its own
+             PTRACE_DETACH path and releases init cleanly. SIGKILL is only the
+             fallback, and even then we poll until the pid is gone so the seize is
+             definitely released before we try to take it ourselves.
+
+           A zombie would keep the tracee relationship alive until reaped, so we
+             also treat our own unreaped child as "still there" and keep waiting;
+             the pid only counts as gone on ESRCH.
+*/
 static void terminate_and_wait(pid_t pid, const char *what) {
   if (kill(pid, SIGTERM) == -1 && errno == ESRCH) return;
 
-  for (int i = 0; i < 25; i++) {
+  for (int i = 0; i < 20; i++) {
     if (kill(pid, 0) == -1 && errno == ESRCH) {
       LOGI("%s (pid %d) terminated", what, (int)pid);
 
@@ -1271,7 +1292,7 @@ static void terminate_and_wait(pid_t pid, const char *what) {
 
   if (kill(pid, SIGKILL) == -1 && errno == ESRCH) return;
 
-  for (int i = 0; i < 25; i++) {
+  for (int i = 0; i < 20; i++) {
     if (kill(pid, 0) == -1 && errno == ESRCH) {
       LOGI("%s (pid %d) terminated", what, (int)pid);
 
@@ -1365,7 +1386,15 @@ void init_monitor() {
 
   /* INFO: Must run before prepare_environment(), which recreates TMP_PATH. A
              monitor from a previous boot watches a dead Zygote tree and must be
-             replaced, not tolerated - see kill_stale_monitor(). */
+             replaced, not tolerated - see kill_stale_monitor().
+
+           Ordering note: killing the old monitor releases its PTRACE_SEIZE on
+             init, and for the moment between that release and our own seize init
+             runs with nobody watching its forks. Doing this as early as possible
+             keeps that unwatched window at the very start of our own startup
+             rather than interleaved with environment setup, which is why this
+             stays the first thing we do.
+  */
   kill_stale_monitor();
 
   if (!prepare_environment()) exit(1);
