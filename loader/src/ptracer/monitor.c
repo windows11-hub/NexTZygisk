@@ -635,7 +635,7 @@ static bool claim_init_tracer() {
     if (errno == EPERM) {
       LOGW("Another process is already tracing init");
 
-      update_status("❌ Multiple Zygisks functioning");
+      update_status("鉂?Multiple Zygisks functioning");
     } else {
       PLOGE("failed to seize init");
     }
@@ -934,10 +934,10 @@ static char post_section[1024];
   if (status ## suffix.supported) {                                                          \
     strlcat(status_text, ", NextZygisk " # suffix "-bit: ", sizeof(status_text));              \
                                                                                              \
-    if (tracing_state != TRACING) strlcat(status_text, "❌", sizeof(status_text));           \
+    if (tracing_state != TRACING) strlcat(status_text, "鉂?, sizeof(status_text));           \
     else if (status ## suffix.zygote_injected && status ## suffix.daemon_running)            \
-      strlcat(status_text, "✅", sizeof(status_text));                                       \
-    else strlcat(status_text, "⚠️", sizeof(status_text));                                    \
+      strlcat(status_text, "鉁?, sizeof(status_text));                                       \
+    else strlcat(status_text, "鈿狅笍", sizeof(status_text));                                    \
                                                                                              \
     if (!status ## suffix.daemon_running) {                                                  \
       if (status ## suffix.daemon_error_info) {                                              \
@@ -1011,18 +1011,18 @@ static bool update_status(const char *message) {
   char status_text[512] = "Monitor: ";
   switch (tracing_state) {
     case TRACING: {
-      strlcat(status_text, "✅", sizeof(status_text));
+      strlcat(status_text, "鉁?, sizeof(status_text));
 
       break;
     }
     case STOPPING: [[fallthrough]];
     case STOPPED: {
-      strlcat(status_text, "⛔", sizeof(status_text));
+      strlcat(status_text, "鉀?, sizeof(status_text));
 
       break;
     }
     case EXITING: {
-      strlcat(status_text, "❌", sizeof(status_text));
+      strlcat(status_text, "鉂?, sizeof(status_text));
 
       break;
     }
