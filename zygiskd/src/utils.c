@@ -955,10 +955,56 @@ bool umount_root(struct root_impl impl) {
   return true;
 }
 
+/* INFO: A saved namespace is only usable for apps if it still contains the
+           external storage mounts.
+
+           The Mounted snapshot is captured from whichever process asks first. On
+             ColorOS that first process can still be missing the per-user storage
+             binds, which are only installed inside mount_external() during
+             postAppSpecialize. A snapshot taken before that point has no
+             /mnt/user or /storage entries at all, and every app that later setns
+             into it loses its view of external storage for good - the "storage
+             temporarily unavailable" breakage.
+
+           Rather than trusting the captured namespace, check for the storage
+             mountpoints and treat a snapshot without them as unusable, so the
+             caller falls back to the process' own namespace.
+*/
+/* INFO: True when the CURRENT mount namespace carries the external storage
+           mounts.
+
+           This must run inside the child that already called setns(): the mount
+             table is a property of the namespace the thread is in, and a
+             namespace fd is not a directory, so /proc/self/fd/<fd>/mountinfo
+             cannot be used to peek at it from outside.
+*/
+static bool namespace_has_external_storage(void) {
+  FILE *mountinfo = fopen("/proc/self/mountinfo", "r");
+  if (!mountinfo) return false;
+
+  bool has_user = false;
+  bool has_storage = false;
+
+  char line[PATH_MAX];
+  while (fgets(line, sizeof(line), mountinfo)) {
+    if (strstr(line, " /mnt/user") || strstr(line, " /mnt/runtime")) has_user = true;
+    if (strstr(line, " /storage/")) has_storage = true;
+
+    if (has_user && has_storage) break;
+  }
+
+  fclose(mountinfo);
+
+  return has_user && has_storage;
+}
+
 int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl impl) {
   static int clean_namespace_fd = -1;
   static int mounted_namespace_fd = -1;
 
+  /* INFO: Cached namespaces are only stored after the child proved they carry
+             the external storage mounts, so a cached entry is safe to hand out
+             directly. */
   if (mns_state == Clean && clean_namespace_fd != -1) return clean_namespace_fd;
   if (mns_state == Mounted && mounted_namespace_fd != -1) return mounted_namespace_fd;
 
@@ -1017,6 +1063,14 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
       _exit(1);
     }
 
+    /* INFO: Tell the parent whether this namespace is actually usable by apps.
+               A snapshot taken before the per-user storage binds existed has no
+               /mnt/user or /storage entries, and caching it would starve every
+               app that later setns into it. */
+    uint8_t has_storage = namespace_has_external_storage() ? 1 : 0;
+    if (write_uint8_t(socket_child, has_storage) == -1)
+      LOGE("Failed to write storage flag to socket_child: %s", strerror(errno));
+
     uint8_t has_opened = 0;
     if (read_uint8_t(socket_child, &has_opened) == -1)
       LOGE("Failed to read from socket_child: %s", strerror(errno));
@@ -1044,6 +1098,15 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
     close(socket_parent);
 
     return -1;
+  }
+
+  /* INFO: Whether the child's namespace carries the external storage mounts.
+             Used below to decide if this snapshot may be cached for reuse. */
+  uint8_t has_storage = 0;
+  if (read_uint8_t(socket_parent, &has_storage) == -1) {
+    LOGE("Failed to read storage flag from socket_parent: %s", strerror(errno));
+
+    has_storage = 0;
   }
 
   char ns_path[PATH_MAX];
@@ -1082,8 +1145,22 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
     return -1;
   }
 
-  if (mns_state == Clean) clean_namespace_fd = ns_fd;
-  else if (mns_state == Mounted) mounted_namespace_fd = ns_fd;
+  /* INFO: Only cache a namespace that apps can actually use. A Mounted snapshot
+             captured before the storage binds existed would starve every app
+             that setns into it, so it is validated first; an unusable one is
+             returned to the caller for this request but never reused.
+  */
+  /* INFO: Cache only namespaces the child proved to carry external storage.
+             A snapshot captured before those binds existed is still returned for
+             this one request, but is never reused - otherwise every later app
+             would inherit a namespace without /mnt/user and /storage. */
+  if (!has_storage) {
+    LOGW("Namespace has no external storage mounts yet, not caching it for reuse");
+  } else if (mns_state == Clean) {
+    clean_namespace_fd = ns_fd;
+  } else if (mns_state == Mounted) {
+    mounted_namespace_fd = ns_fd;
+  }
 
   return ns_fd;
 }
