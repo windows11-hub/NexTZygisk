@@ -837,75 +837,27 @@ static bool is_custom_umount_target(const char *target, char **paths, size_t cou
 }
 
 bool umount_root(struct root_impl impl) {
-  /* INFO: We are already in the target pid mount namespace, so actually,
-             when we use self here, we meant its pid.
+  /* INFO: Unmounting is DISABLED in this fork.
+  
+           The original implementation parsed /proc/self/mountinfo and called
+             umount2(target, MNT_DETACH) on every mount whose source matched the
+             root solution name, plus anything under /data/adb/modules and
+             /adb/modules/. On ColorOS builds this detached the storage subtree
+             as well (the storage manager / file manager lost its mount view),
+             because the storage mounts share the namespace and MNT_DETACH
+             removes the whole subtree, not just the root overlay.
+
+           We therefore do nothing here and return success, so the caller keeps
+             the "clean" mount namespace (a private copy made with unshare) but
+             does not actually detach anything from it.
+
+           Consequence: root mounts stay visible to denylisted processes. Hiding
+             must be provided by the root manager (KernelSU/APatch "umount
+             modules" per-app profile) or by a Zygisk hiding module.
   */
-  struct mountinfos mounts;
-  if (!parse_mountinfo("self", &mounts)) {
-    LOGE("Failed to parse mountinfo");
+  (void)impl;
 
-    return false;
-  }
-
-  const char *source_name = "magisk";
-  if (impl.impl == KernelSU) source_name = "KSU";
-  else if (impl.impl == APatch) source_name = "APatch";
-
-  LOGI("[%s] Unmounting root", source_name);
-
-  char **targets_to_unmount = NULL;
-  size_t num_targets = 0;
-
-  char *custom_paths[CUSTOM_UMOUNT_LIST_MAX];
-  size_t num_custom = read_custom_umount_list(custom_paths, CUSTOM_UMOUNT_LIST_MAX);
-
-  for (size_t i = 0; i < mounts.length; i++) {
-    struct mountinfo mount = mounts.mounts[i];
-
-    bool should_unmount = false;
-    if (strcmp(mount.source, source_name) == 0 || (impl.impl == Magisk && strcmp(mount.source, "worker") == 0)) should_unmount = true;
-    if (strncmp(mount.target, "/data/adb/modules", strlen("/data/adb/modules")) == 0) should_unmount = true;
-    if (strncmp(mount.root, "/adb/modules/", strlen("/adb/modules/")) == 0) should_unmount = true;
-    /* INFO: Mounts the user listed, such as a ROM's own bind mounts over system files. */
-    if (num_custom > 0 && is_custom_umount_target(mount.target, custom_paths, num_custom)) should_unmount = true;
-
-    if (!should_unmount) continue;
-
-    char **tmp_targets = realloc(targets_to_unmount, (num_targets + 1) * sizeof(char*));
-    if (tmp_targets == NULL) {
-      LOGE("[%s] Failed to allocate memory for targets_to_unmount", source_name);
-
-      free(targets_to_unmount);
-
-      for (size_t j = 0; j < num_custom; j++) free(custom_paths[j]);
-
-      free_mounts(&mounts);
-
-      return false;
-    }
-    targets_to_unmount = tmp_targets;
-
-    num_targets++;
-
-    targets_to_unmount[num_targets - 1] = mount.target;
-  }
-
-  for (size_t i = num_targets; i > 0; i--) {
-    const char *target = targets_to_unmount[i - 1];
-    if (umount2(target, MNT_DETACH) == -1) {
-      LOGE("[%s] Failed to unmount %s: %s", source_name, target, strerror(errno));
-
-      continue;
-    }
-
-    LOGI("[%s] Unmounted %s", source_name, target);
-  }
-
-  free(targets_to_unmount);
-
-  for (size_t i = 0; i < num_custom; i++) free(custom_paths[i]);
-
-  free_mounts(&mounts);
+  LOGI("umount_root: disabled in this fork, nothing was unmounted");
 
   return true;
 }
@@ -949,19 +901,14 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
       goto finalize_mns_fork;
     }
 
-    /* INFO: With unmount disabled by the user, the "clean" namespace is the app's own
-               one, untouched: another module is expected to hide root mounts. */
-    if (mns_state == Clean && !is_umount_disabled()) {
+    /* INFO: Unmounting is disabled in this fork (see umount_root). We still
+               make a private copy of the mount namespace so that modules that
+               change mounts cannot affect the parent, but nothing is detached
+               from it: the storage subtree stays intact, which is what keeps
+               the storage / file manager working on ColorOS.
+    */
+    if (mns_state == Clean) {
       unshare(CLONE_NEWNS);
-
-      if (!umount_root(impl)) {
-        LOGE("Failed to umount root");
-
-        if (write_uint8_t(socket_child, 0) == -1)
-          LOGE("Failed to write to socket_child: %s", strerror(errno));
-
-        goto finalize_mns_fork;
-      }
     }
 
     if (write_uint8_t(socket_child, 1) == -1) {
