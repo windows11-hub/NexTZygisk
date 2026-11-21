@@ -141,12 +141,31 @@ void ksu_get_existence(struct root_impl_state *state) {
 
   ksu_uses_new_ksuctl = true;
 
+  /* INFO: Leave KernelSU's own kernel-side unmount ENABLED.
+
+           Upstream disables it here (.value = 0) because NextZygisk then performs
+             the unmount itself in umount_root(). This fork does not unmount
+             anything (see umount_root in utils.c) and also refuses to enter the
+             clean mount namespace, because the unshare() snapshot taken during
+             specialisation predates the app's external-storage bind mounts and
+             therefore breaks the storage manager / file manager.
+
+           With both of those off, turning KernelSU's own unmount off as well
+             would leave nothing hiding the root mounts: the per-app "umount
+             modules" profile would stop taking effect and every denylisted app
+             would see the module overlays outright.
+
+           So the feature is explicitly turned back on (.value = 1) and the hiding
+             responsibility stays with KernelSU, which is where the App Profile
+             switch the README points at actually lives. NextSUSFS keeps working
+             as before: it feeds KernelSU, not us.
+  */
   struct ksu_set_feature_cmd cmd = {
     .feature_id = 1, /* INFO: kernel_umount */
-    .value = 0
+    .value = 1
   };
 
-  /* INFO: Tell KernelSU to not umount, and let us handle it */
+  /* INFO: Restore KernelSU's kernel-side unmount and let it do the work. */
   if (ioctl(ksu_fd, KSU_IOCTL_SET_FEATURE, &cmd) == -1) {
     LOGW("Failed to ioctl KSU_IOCTL_SET_FEATURE: %s\n", strerror(errno));
 
