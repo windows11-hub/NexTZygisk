@@ -38,19 +38,21 @@ create_sys_perm() {
 
 export TMP_PATH=/data/adb/rezygisk
 
-# INFO: Do NOT wipe the whole directory on every boot.
+# INFO: Drop the previous boot's runtime files, but do it deliberately.
 #
-#   A soft reboot (setprop ctl.restart zygote / ksud's emulated soft reboot)
-#   re-runs this script while the monitor from the previous boot is still alive
-#   and still tracing init. Wiping TMP_PATH removed its control socket and its
-#   state file out from under it, and the fresh monitor then failed to bind -
-#   Zygisk stayed dead until a full reboot.
+#   Why the directory is cleaned: the control socket is a filesystem socket
+#   (/data/adb/rezygisk/init_monitor). A file left over from a previous boot or
+#   from a monitor that was killed makes the new monitor's bind() fail with
+#   EADDRINUSE, it exits without writing state.json, and every client then sees
+#   "Daemon: not running" with connect() -> ECONNREFUSED (111).
 #
-#   Only remove what must not survive: the previous state.json, so the dashboard
-#   never reports stale data from an earlier boot. The socket is left alone; a
-#   live monitor keeps it, and a dead one leaves a stale file that bind() will
-#   simply replace after the monitor unlinks it at startup.
-rm -f "$TMP_PATH/state.json"
+#   Why the state file is removed explicitly as well: the WebUI must not show a
+#   state report from an earlier boot.
+#
+#   The monitor now also unlinks the socket itself right before bind(), so a
+#   stale file can no longer wedge startup even if this script is skipped (a
+#   soft reboot re-runs the module scripts, but the ordering is not guaranteed).
+rm -rf "$TMP_PATH"
 
 mkdir -p "$TMP_PATH"
 create_sys_perm $TMP_PATH
