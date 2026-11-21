@@ -1157,6 +1157,39 @@ static bool prepare_environment() {
            monitor is still alive, the new process exits immediately and leaves
            the running one (and its injection state) untouched.
 */
+/* INFO: Does this device actually run a 32-bit Zygote?
+
+           Two independent signals, cheapest first:
+             1. ro.zygote says which Zygotes init starts ("zygote64", "zygote",
+                "zygote64_32", "zygote_32_64"). This build only needs the
+                32-bit daemon when that string mentions a 32-bit variant.
+             2. As a fallback, look for a 32-bit app_process32 on disk.
+
+           Reading the property through __system_property_get avoids spawning a
+             process on the boot path. utils.c already declares that symbol.
+*/
+extern int __system_property_get(const char *, char *);
+
+static bool device_has_32bit_runtime(void) {
+  /* INFO: PROP_VALUE_MAX is 92 on Android, but pulling in
+             cutils/properties.h for it would add an Android-private dependency
+             to a loader that currently builds with only libc headers. A fixed
+             buffer comfortably larger than any ro.zygote value keeps this
+             self-contained. */
+  char zygote_prop[128] = { 0 };
+
+  if (__system_property_get("ro.zygote", zygote_prop) > 0) {
+    /* INFO: "zygote64" is 64-bit only; anything mentioning 32 alongside it
+               ("zygote64_32", "zygote_32_64") does start a 32-bit Zygote. */
+    if (strstr(zygote_prop, "32") != NULL) return true;
+
+    if (strcmp(zygote_prop, "zygote64") == 0) return false;
+  }
+
+  /* INFO: Fallback for ROMs that do not set ro.zygote usefully. */
+  return access("/system/bin/app_process32", F_OK) == 0;
+}
+
 /* INFO: Find every live zygisk-ptrace monitor except ourselves.
 
            The pid file is written on every start, but it is not authoritative:
@@ -1390,10 +1423,32 @@ void init_monitor() {
              and will retry if this attempt did not survive.
   */
   bool daemon64_started = ensure_daemon_created(true);
-  bool daemon32_started = ensure_daemon_created(false);
 
   if (daemon64_started) LOGI("Pre-started NextZygiskd64");
-  if (daemon32_started) LOGI("Pre-started NextZygiskd32");
+
+  /* INFO: The 32-bit daemon is only pre-started when the device can run one.
+
+           bin/zygiskd32 is a 32-bit ELF. On an arm64-only build (empty
+             ro.product.cpu.abilist32, which is this target) execl() fails at once
+             and the child exits - but ensure_daemon_created() has already set
+             status32.daemon_running = true, so the monitor held a stale "running"
+             state for a dead process. The 32-bit injection path then behaved as if
+             a daemon were reachable and failed.
+
+           The 32-bit branch is only meaningful when a 32-bit Zygote exists. We
+             detect that from the same ABI property the boot script already uses to
+             choose between zygisk-ptrace64 and zygisk-ptrace32, and otherwise leave
+             status32 alone so its PRE_INJECT(32) branch never claims a daemon.
+  */
+  bool daemon32_started = false;
+
+  if (device_has_32bit_runtime()) {
+    daemon32_started = ensure_daemon_created(false);
+
+    if (daemon32_started) LOGI("Pre-started NextZygiskd32");
+  } else {
+    LOGI("No 32-bit runtime on this device, not starting NextZygiskd32");
+  }
 
   /* INFO: Give the freshly started daemon a brief, bounded chance to bind.
 
