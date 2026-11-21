@@ -1436,33 +1436,7 @@ static void rz_cleanup(struct zygisk_context *ctx) {
 
   if (!is_zygote_child(ctx)) return;
 
-  /* INFO: Self-unloading is DISABLED in this fork.
-
-           Upstream sets should_unmap_zygisk here, which makes the next
-             pthread_attr_setstacksize() on the main thread unhook everything,
-             csoloader_deinit() and munmap libzygisk.so out of the process. The
-             intent is that Zygisk leaves no trace once the modules are loaded.
-
-           Why that breaks modules: Zygisk module hooks registered through the
-             API are installed here, but some modules need to keep using that
-             machinery well after specialisation. FuseHide (zygisk backend) is
-             the concrete case: it hooks linker's do_dlopen at
-             postAppSpecialize, then WAITS for libfuse_jni.so to be loaded by
-             MediaProvider later during its own init, and only then installs the
-             FUSE hooks through the API bridge. Once libzygisk.so is unmapped, the
-             Dobby/LSPlt plumbing that module is holding is gone, so the hook it
-             waits for never lands and the module silently does nothing. That is
-             the "FuseHide does not work with this build" symptom.
-
-           Keeping ourselves mapped costs a little resident memory per app and
-             leaves the library visible in /proc/self/maps, which is a detection
-             surface - but a module that cannot load at all is worse, and the
-             existing hiding modules are what the user relies on here.
-
-           Do not restore the upstream behaviour without first making every
-             module's late hooking work against a separate, longer-lived library.
-  */
-  should_unmap_zygisk = false;
+  should_unmap_zygisk = true;
 
   /* INFO: Unhook JNI methods */
   for (size_t i = 0; i < jni_hook_list_count; i++) {
@@ -1509,44 +1483,13 @@ static void rz_cleanup(struct zygisk_context *ctx) {
     plt_hook_list_count = 0;
   }
 
-  /* INFO: API pointers are KEPT alive in this fork.
+  /* INFO: Strip out all API function pointers */
+  for (size_t i = 0; i < zygisk_module_length; i++) {
+    memset(&zygisk_modules[i], 0, sizeof(zygisk_modules[i]));
+  }
 
-           Upstream wipes every module's `struct rezygisk_api` here, so the
-             function pointers a module was handed (plt_hook_register,
-             plt_hook_register_v4, plt_hook_commit, hook_register, ...) become
-             NULL the moment specialisation ends. That is fine for a module that
-             installs all of its hooks during pre/postAppSpecialize and never
-             touches the API again.
-
-           It is fatal for a module that hooks LATER. FuseHide's Zygisk backend
-             hooks linker's do_dlopen first, then waits for MediaProvider to
-             dlopen libfuse_jni.so, and only then calls plt_hook_register /
-             plt_hook_commit through exactly these pointers. With them zeroed,
-             that late registration dereferences NULL and the module does
-             nothing - the "FuseHide does not run" symptom.
-
-           Keeping the structs intact costs sizeof(struct rezygisk_module) per
-             loaded module and keeps the API reachable; the library itself stays
-             mapped too, because the unloader is disabled above. Both are required
-             for late hooking to work at all.
-
-           Do not restore the memset without giving modules a separate,
-             longer-lived API table.
-  */
-
-  /* INFO: Never enable the unloader: should_unmap_zygisk is pinned false
-             above, and leaving the flag off keeps the unmap path from
-             running even if some other code sets should_unmap_zygisk. */
-  enable_unloader = false;
-  /* INFO: The lock is NOT destroyed here, for the same reason the API table is
-             kept: plt_hook_register*() take g_ctx->hook_info_lock, and a module
-             that registers hooks after specialisation (FuseHide waiting for
-             libfuse_jni.so) would lock a destroyed mutex - undefined behaviour,
-             in practice a hang or a crash inside MediaProvider.
-
-             ctx itself is per-fork and dies with the process, so not destroying
-             the mutex leaks nothing that outlives its use.
-  */
+  enable_unloader = true;
+  pthread_mutex_destroy(&ctx->hook_info_lock);
 }
 
 /* INFO: PLT hook commit helper */
