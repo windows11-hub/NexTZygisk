@@ -869,15 +869,27 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
       goto finalize_mns_fork;
     }
 
-    /* INFO: Unmounting is disabled in this fork (see umount_root). We still
-               make a private copy of the mount namespace so that modules that
-               change mounts cannot affect the parent, but nothing is detached
-               from it: the storage subtree stays intact, which is what keeps
-               the storage / file manager working on ColorOS.
+    /* INFO: Unmounting is disabled in this fork (see umount_root), so entering
+               the "clean" namespace now buys nothing and costs correctness.
+
+           What it would cost: unshare() snapshots the mount table at this very
+             instant, but zygote only creates the app's external-storage bind
+             mounts after specialisation, from mount_external. A process that is
+             switched into the snapshot later finds /storage and /mnt/user
+             present but without the mounts its UID needs - the storage manager
+             and file manager then report broken storage.
+
+           Since this fork never detaches the root overlays, the snapshot would
+             be identical to the Zygote namespace except for those missing mounts,
+             so there is nothing to gain. We therefore keep the Zygote namespace
+             untouched for every process.
+
+           Root hiding must come from the root manager's own per-app "umount
+             modules" profile or from a dedicated hiding module - the same
+             arrangement the README already documents for
+             /data/adb/nextzygisk/umount_disabled. That switch keeps working: it
+             only ever suppressed this same path.
     */
-    if (mns_state == Clean) {
-      unshare(CLONE_NEWNS);
-    }
 
     if (write_uint8_t(socket_child, 1) == -1) {
       LOGE("Failed to write to socket_child: %s", strerror(errno));
