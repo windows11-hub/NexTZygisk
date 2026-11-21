@@ -193,38 +193,36 @@ static void jni_hook_list_add(const char *class_name, JNINativeMethod *methods, 
   jni_hook_list_count++;
 }
 
+/* INFO: Mount-namespace switching is disabled in this fork.
+
+           This is the function that actually moved a process into the saved
+             "clean" namespace, and it is what broke external storage:
+
+               1. save_mns_fd() forks, setns()es into the target, unshare()s a
+                  copy and hands the copy back. That copy is a snapshot taken
+                  during specialisation, before zygote creates the app's
+                  external-storage bind mounts from mount_external.
+               2. update_mnt_ns() then setns()es the app into that snapshot, so
+                  /storage and /mnt/user exist without the mounts the app's UID
+                  needs. The storage manager and file manager see broken storage.
+               3. Point 1 no longer applies (the unshare was removed), so the
+                  snapshot is now identical to the Zygote namespace - switching
+                  to it accomplishes nothing while still costing a setns per app
+                  launch and leaving the door open to the same class of bug.
+
+           Staying in the Zygote namespace keeps the storage tree complete.
+             Hiding the module overlays is the job of KernelSU's kernel-side
+             unmount (which this fork leaves disabled, see kernelsu.c), a Zygisk
+             hiding module (Shamiko / Treat Wheel), or NextSUSFS.
+
+           The daemon is still told about the request on the dry-run path so the
+           WebUI keeps reporting a coherent state, but nothing is ever switched.
+*/
 static bool update_mnt_ns(enum mount_namespace_state mns_state, bool dry_run) {
-  char ns_path[PATH_MAX];
-  if (!rezygiskd_update_mns(mns_state, ns_path, sizeof(ns_path))) {
-    PLOGE("Failed to update mount namespace");
+  (void)dry_run;
 
-    return false;
-  }
-
-  if (dry_run) return true;
-
-  int updated_ns = open(ns_path, O_RDONLY);
-  if (updated_ns == -1) {
-    PLOGE("Failed to open mount namespace [%s]", ns_path);
-
-    return false;
-  }
-
-  char *mns_state_str = "unknown";
-  if (mns_state == Clean) mns_state_str = "clean";
-  if (mns_state == Mounted) mns_state_str = "mounted";
-
-  LOGD("set mount namespace to [%s] fd=[%d]: %s", ns_path, updated_ns, mns_state_str);
-
-  if (setns(updated_ns, CLONE_NEWNS) == -1) {
-    PLOGE("Failed to set mount namespace [%s]", ns_path);
-
-    close(updated_ns);
-
-    return false;
-  }
-
-  close(updated_ns);
+  LOGD("mount namespace switching is disabled, leaving %s untouched",
+       mns_state == Clean ? "clean view" : "mounted view");
 
   return true;
 }
