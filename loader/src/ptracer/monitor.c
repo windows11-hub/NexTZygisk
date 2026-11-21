@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -418,7 +419,21 @@ void rezygiskd_listener_stop() {
   monitor_sock_fd = -1;
 }
 
-#define MAX_RETRY_COUNT 5
+/* INFO: Raised for soft reboot support.
+
+         The original limit was 5 zygote starts within 30 seconds before the
+         monitor declared "Zygote crashed" and stopped injecting until the next
+         hard reboot. A soft reboot (setprop ctl.restart zygote, or ksud's
+         emulated soft reboot) restarts Zygote several times in quick
+         succession, which tripped the counter and left Zygisk dead until a
+         full reboot - the "soft reboot loses zygisk" bug.
+
+         A genuine crash loop still needs a stop condition, so the count is
+         kept but the window and the ceiling are both widened: up to 40 starts
+         within 30 seconds. Real crash loops hit that in under a second, while
+         a soft reboot (3-6 restarts) stays far below it.
+*/
+#define MAX_RETRY_COUNT 40
 
 #define CREATE_ZYGOTE_START_COUNTER(abi)             \
   struct timespec last_zygote##abi = {               \
@@ -1042,12 +1057,96 @@ static bool prepare_environment() {
   return true;
 }
 
+/* INFO: Single-instance guard.
+
+           A soft reboot re-runs post-fs-data.sh while the monitor from the
+           previous boot is still alive and still holding the ptrace seize on
+           init. Without this check the new monitor would start, fail to seize
+           init (EPERM), print "Multiple Zygisks functioning" and exit - and the
+           old monitor, whose helper daemons were just replaced, ends up in a
+           broken state. The result was "soft reboot loses Zygisk".
+
+           The pid file makes the second start a no-op instead: if the recorded
+           monitor is still alive, the new process exits immediately and leaves
+           the running one (and its injection state) untouched.
+*/
+static bool monitor_already_running() {
+  char pid_path[PATH_MAX];
+  snprintf(pid_path, sizeof(pid_path), "%s/monitor.pid", rezygiskd_get_path());
+
+  FILE *f = fopen(pid_path, "r");
+  if (!f) return false;
+
+  long old_pid = -1;
+  if (fscanf(f, "%ld", &old_pid) != 1) old_pid = -1;
+  fclose(f);
+
+  if (old_pid <= 0) return false;
+
+  /* INFO: Check that the pid still belongs to a zygisk-ptrace monitor, not to
+             an unrelated process that reused the number. */
+  char exe_path[PATH_MAX];
+  snprintf(exe_path, sizeof(exe_path), "/proc/%ld/cmdline", old_pid);
+
+  FILE *cmd = fopen(exe_path, "r");
+  if (!cmd) return false;
+
+  char cmdline[PATH_MAX] = { 0 };
+  size_t got = fread(cmdline, 1, sizeof(cmdline) - 1, cmd);
+  fclose(cmd);
+
+  if (got == 0) return false;
+
+  bool is_monitor = strstr(cmdline, "zygisk-ptrace") != NULL &&
+                    strstr(cmdline, "monitor") != NULL;
+
+  if (!is_monitor) return false;
+
+  LOGW("A monitor is already running (pid %ld), leaving it alone", old_pid);
+
+  return true;
+}
+
+static void write_monitor_pid() {
+  char pid_path[PATH_MAX];
+  snprintf(pid_path, sizeof(pid_path), "%s/monitor.pid", rezygiskd_get_path());
+
+  FILE *f = fopen(pid_path, "w");
+  if (!f) {
+    PLOGE("failed to write monitor pid file");
+
+    return;
+  }
+
+  fprintf(f, "%d\n", getpid());
+  fclose(f);
+}
+
 void init_monitor() {
   LOGI("ReZygisk %s", ZKSU_VERSION);
 
+  /* INFO: Must run before prepare_environment(), which may recreate TMP_PATH. */
+  if (monitor_already_running()) {
+    LOGI("Monitor already active, this instance will exit");
+
+    exit(0);
+  }
+
   if (!prepare_environment()) exit(1);
 
-  if (!claim_init_tracer()) exit(1);
+  write_monitor_pid();
+
+  if (!claim_init_tracer()) {
+    /* INFO: Another tracer got there first between our check and the seize.
+               Leave quietly rather than fighting over init. */
+    if (errno == EPERM) {
+      LOGW("init is already traced by someone else, exiting");
+
+      exit(0);
+    }
+
+    exit(1);
+  }
 
   monitor_events_init();
 
