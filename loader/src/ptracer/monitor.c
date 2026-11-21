@@ -3,6 +3,8 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <signal.h>
+#include <dirent.h>
 
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -151,9 +153,25 @@ bool rezygiskd_listener_init() {
 
   size_t sun_path_len = sprintf(addr.sun_path, "%s/%s", rezygiskd_get_path(), SOCKET_NAME);
 
+  /* INFO: This is a filesystem socket, not an abstract one, so a stale file
+             left by a previous boot (or by a previous monitor that was killed)
+             makes bind() fail with EADDRINUSE - and the monitor then exits
+             without ever writing state.json, which is exactly the
+             "Daemon: not running / connect refused (111)" breakdown.
+
+           Unlinking first is safe: if a live monitor owns the socket we never
+           reach this point, because init_monitor() bails out earlier when it
+           sees a running monitor. A subsequent bind() would then fail with
+           ECONNREFUSED for clients, which is what the leftover file caused.
+  */
+  unlink(addr.sun_path);
+
   socklen_t socklen = sizeof(sa_family_t) + sun_path_len;
   if (bind(monitor_sock_fd, (struct sockaddr *)&addr, socklen) == -1) {
     PLOGE("bind socket");
+
+    close(monitor_sock_fd);
+    monitor_sock_fd = -1;
 
     return false;
   }
@@ -543,6 +561,38 @@ static bool ensure_daemon_created(bool is_64bit) {
     }                                                                 \
   }
 
+/* INFO: Vendor (ColorOS / OxygenOS) Zygote.
+
+           stock Android execs /system/bin/app_process64, and PRE_INJECT above
+           matches that exact path. OPPO's ColorOS instead runs a second Zygote
+           called "zygote_ocomp" (seen in the field as
+           /system/bin/zygote_ocomp64 or a vendor-private path), whose
+           /proc/<pid>/exe therefore does not match APP_PROCESS_64/32. Without
+           this branch tracer stayed NULL for every process, so the monitor
+           started, seized init and then silently injected nothing - the build
+           "installs but does nothing" symptom.
+
+           We match on the basename so any vendor prefix or suffix is covered,
+           and keep the same abi/daemon guards as the stock branches.
+*/
+static bool is_vendor_zygote(const char *program, bool *is_64bit) {
+  const char *base = strrchr(program, '/');
+  base = base ? base + 1 : program;
+
+  /* INFO: Only the vendor Zygote names we know; a plain "zygote" is not a
+             Zygote here (it is the launcher that forks app_process). */
+  if (strncmp(base, "zygote_ocomp", 12) != 0 &&
+      strncmp(base, "zygote_oplus", 12) != 0) {
+    return false;
+  }
+
+  /* INFO: A bare name is 64-bit on every ABI this build targets; an explicit
+             "32" suffix means the 32-bit Zygote. */
+  *is_64bit = !(strstr(base, "32") != NULL);
+
+  return true;
+}
+
 #define PRE_INJECT_TANGO                                           \
   if (strcmp(program, "/system_ext/bin/tango_translator") == 0) {  \
     tracer = "./bin/zygisk-ptrace32";                              \
@@ -752,6 +802,43 @@ void sigchld_listener_callback() {
             PRE_INJECT(64, true)
             PRE_INJECT(32, false)
             PRE_INJECT_TANGO
+
+            /* INFO: Vendor (ColorOS) Zygote, matched by basename.
+                       Stock app_process64 never appears on those builds, so
+                       without this the monitor seized init and injected
+                       nothing at all. */
+            if (tracer == NULL) {
+              bool vendor_is_64 = true;
+
+              if (is_vendor_zygote(program, &vendor_is_64)) {
+                bool abi_key = vendor_is_64;
+
+                tracer = abi_key ? "./bin/zygisk-ptrace64" : "./bin/zygisk-ptrace32";
+                is_tango = false;
+
+                LOGI("Vendor zygote detected (%s, 64-bit: %s)", program, abi_key ? "yes" : "no");
+
+                if (abi_key ? should_stop_inject64() : should_stop_inject32()) {
+                  LOGW("Vendor zygote restart too many times, stop injecting");
+
+                  tracing_state = STOPPING;
+                  monitor_stop_reason = "Zygote crashed";
+                  ptrace(PTRACE_INTERRUPT, 1, 0, 0);
+
+                  break;
+                }
+
+                if (!ensure_daemon_created(abi_key)) {
+                  LOGW("NextZygiskd not running, stop injecting");
+
+                  tracing_state = STOPPING;
+                  monitor_stop_reason = "NextZygiskd not running";
+                  ptrace(PTRACE_INTERRUPT, 1, 0, 0);
+
+                  break;
+                }
+              }
+            }
 
             if (tracer != NULL) {
               LOGD("Stopping %d (program: %s, tracer: %s, tango: %s)", pid, program, tracer, is_tango ? "yes" : "no");
@@ -1070,41 +1157,159 @@ static bool prepare_environment() {
            monitor is still alive, the new process exits immediately and leaves
            the running one (and its injection state) untouched.
 */
-static bool monitor_already_running() {
+/* INFO: Find every live zygisk-ptrace monitor except ourselves.
+
+           The pid file is written on every start, but it is not authoritative:
+           post-fs-data.sh wipes TMP_PATH, and a monitor killed hard leaves a
+           stale or missing record. Scanning /proc by cmdline is the reliable
+           way to catch one that is still holding PTRACE_SEIZE on init.
+*/
+static size_t find_live_monitors(pid_t *out, size_t max) {
+  DIR *proc = opendir("/proc");
+  if (!proc) return 0;
+
+  size_t count = 0;
+  pid_t self = getpid();
+
+  struct dirent *entry;
+  while (count < max && (entry = readdir(proc)) != NULL) {
+    char *end = NULL;
+    long pid = strtol(entry->d_name, &end, 10);
+
+    if (pid <= 0 || end == NULL || *end != '\0') continue;
+    if ((pid_t)pid == self) continue;
+
+    char cmdline_path[PATH_MAX];
+    snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%ld/cmdline", pid);
+
+    FILE *f = fopen(cmdline_path, "r");
+    if (!f) continue;
+
+    char cmdline[PATH_MAX] = { 0 };
+    size_t got = fread(cmdline, 1, sizeof(cmdline) - 1, f);
+    fclose(f);
+
+    if (got == 0) continue;
+
+    if (strstr(cmdline, "zygisk-ptrace") != NULL && strstr(cmdline, "monitor") != NULL) {
+      out[count++] = (pid_t)pid;
+    }
+  }
+
+  closedir(proc);
+
+  return count;
+}
+
+/* INFO: Make sure no monitor from a previous boot survives us.
+
+           A monitor is only meaningful for the Zygote tree it seized. After a
+           soft reboot (or a Zygote crash) the old monitor is still alive and
+           still holds PTRACE_SEIZE on init, but it watches a Zygote that no
+           longer exists: its restart counters are stale, its daemon pids are
+           stale, and its injection targets are gone. Leaving it in place means
+           the new monitor cannot seize init (EPERM) and the old one never
+           injects the new Zygote - Zygisk appears completely dead.
+
+           So the old one must be killed, not tolerated. We stop it, then kill
+           it, and wait for it to disappear before continuing.
+*/
+/* INFO: Terminate one process and wait until the kernel has reaped it.
+
+           Waiting matters: the ptrace seize on init is released by the kernel
+           when the tracer exits, not when the signal is delivered. If we seize
+           init too early the call fails with EPERM and we would wrongly conclude
+           that another tracer owns it.
+*/
+static void terminate_and_wait(pid_t pid, const char *what) {
+  if (kill(pid, SIGTERM) == -1 && errno == ESRCH) return;
+
+  for (int i = 0; i < 25; i++) {
+    if (kill(pid, 0) == -1 && errno == ESRCH) {
+      LOGI("%s (pid %d) terminated", what, (int)pid);
+
+      return;
+    }
+
+    usleep(10000);
+  }
+
+  LOGW("%s (pid %d) ignored SIGTERM, sending SIGKILL", what, (int)pid);
+
+  if (kill(pid, SIGKILL) == -1 && errno == ESRCH) return;
+
+  for (int i = 0; i < 25; i++) {
+    if (kill(pid, 0) == -1 && errno == ESRCH) {
+      LOGI("%s (pid %d) terminated", what, (int)pid);
+
+      return;
+    }
+
+    usleep(10000);
+  }
+
+  LOGE("%s (pid %d) survived SIGKILL", what, (int)pid);
+}
+
+/* INFO: Make sure no monitor from a previous boot survives us.
+
+           A monitor only means something for the Zygote tree it seized. After a
+           soft reboot (or a Zygote crash) the old monitor is still alive and
+           still holds PTRACE_SEIZE on init, but the Zygote it was watching is
+           gone: its restart counters are stale, its daemon pids are stale, its
+           injection targets no longer exist. Tolerating it - which is what the
+           first version of this guard did - means the new monitor cannot seize
+           init (EPERM) and the old one never injects the new Zygote, so Zygisk
+           looks completely dead until a hard reboot.
+
+           So it is replaced, not respected. Both the pid file and a /proc scan
+           are consulted: the pid file is what we write, but post-fs-data.sh
+           wipes TMP_PATH and a hard-killed monitor leaves nothing behind, so the
+           scan is what actually guarantees we find it.
+*/
+static void kill_stale_monitor() {
+  pid_t victims[8];
+  size_t count = 0;
+
+  /* INFO: Primary source: the pid recorded by the previous start. */
   char pid_path[PATH_MAX];
   snprintf(pid_path, sizeof(pid_path), "%s/monitor.pid", rezygiskd_get_path());
 
   FILE *f = fopen(pid_path, "r");
-  if (!f) return false;
+  if (f) {
+    long old_pid = -1;
 
-  long old_pid = -1;
-  if (fscanf(f, "%ld", &old_pid) != 1) old_pid = -1;
-  fclose(f);
+    if (fscanf(f, "%ld", &old_pid) == 1 && old_pid > 0 && old_pid != (long)getpid()) {
+      victims[count++] = (pid_t)old_pid;
+    }
 
-  if (old_pid <= 0) return false;
+    fclose(f);
+  }
 
-  /* INFO: Check that the pid still belongs to a zygisk-ptrace monitor, not to
-             an unrelated process that reused the number. */
-  char exe_path[PATH_MAX];
-  snprintf(exe_path, sizeof(exe_path), "/proc/%ld/cmdline", old_pid);
+  /* INFO: Fallback: everything that looks like a monitor. Covers the case where
+             the pid file is missing or stale. */
+  pid_t scanned[8];
+  size_t scanned_count = find_live_monitors(scanned, 8);
 
-  FILE *cmd = fopen(exe_path, "r");
-  if (!cmd) return false;
+  for (size_t i = 0; i < scanned_count && count < 8; i++) {
+    bool dup = false;
 
-  char cmdline[PATH_MAX] = { 0 };
-  size_t got = fread(cmdline, 1, sizeof(cmdline) - 1, cmd);
-  fclose(cmd);
+    for (size_t j = 0; j < count; j++) {
+      if (victims[j] == scanned[i]) {
+        dup = true;
 
-  if (got == 0) return false;
+        break;
+      }
+    }
 
-  bool is_monitor = strstr(cmdline, "zygisk-ptrace") != NULL &&
-                    strstr(cmdline, "monitor") != NULL;
+    if (!dup) victims[count++] = scanned[i];
+  }
 
-  if (!is_monitor) return false;
+  for (size_t i = 0; i < count; i++) {
+    LOGW("Replacing stale monitor (pid %d) from a previous boot", (int)victims[i]);
 
-  LOGW("A monitor is already running (pid %ld), leaving it alone", old_pid);
-
-  return true;
+    terminate_and_wait(victims[i], "stale monitor");
+  }
 }
 
 static void write_monitor_pid() {
@@ -1125,12 +1330,10 @@ static void write_monitor_pid() {
 void init_monitor() {
   LOGI("ReZygisk %s", ZKSU_VERSION);
 
-  /* INFO: Must run before prepare_environment(), which may recreate TMP_PATH. */
-  if (monitor_already_running()) {
-    LOGI("Monitor already active, this instance will exit");
-
-    exit(0);
-  }
+  /* INFO: Must run before prepare_environment(), which recreates TMP_PATH. A
+             monitor from a previous boot watches a dead Zygote tree and must be
+             replaced, not tolerated - see kill_stale_monitor(). */
+  kill_stale_monitor();
 
   if (!prepare_environment()) exit(1);
 
