@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -177,7 +178,9 @@ int unix_listener_from_path(const char *restrict path) {
     return -1;
   }
 
-  int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  /* INFO: CLOEXEC so companions never inherit the listener: otherwise connect()
+             still succeeds after ReZygiskd died and clients hang forever. */
+  int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (socket_fd == -1) {
     LOGE("socket: %s", strerror(errno));
 
@@ -197,7 +200,8 @@ int unix_listener_from_path(const char *restrict path) {
     return -1;
   }
 
-  if (listen(socket_fd, 2) == -1) {
+  /* INFO: Every app launch queues here, keep the backlog wide for boot bursts. */
+  if (listen(socket_fd, SOMAXCONN) == -1) {
     LOGE("listen: %s", strerror(errno));
 
     close(socket_fd);
@@ -347,9 +351,131 @@ ssize_t read_string(int fd, char *restrict buf, size_t buf_size) {
     return -1;
   }
 
-  if (str_len > 0) buf[str_len] = '\0';
+  /* INFO: Terminate empty strings too, callers use buf right away. */
+  buf[str_len] = '\0';
 
   return read_bytes;
+}
+
+char *exec_command_output(const char *restrict file, const char *const argv[], size_t max_len) {
+  int link[2];
+  if (pipe2(link, O_CLOEXEC) == -1) {
+    LOGE("pipe2: %s", strerror(errno));
+
+    return NULL;
+  }
+
+  pid_t pid = fork();
+  if (pid == -1) {
+    LOGE("fork: %s", strerror(errno));
+
+    close(link[0]);
+    close(link[1]);
+
+    return NULL;
+  }
+
+  if (pid == 0) {
+    /* INFO: dup2 clears O_CLOEXEC on the new descriptor. */
+    dup2(link[1], STDOUT_FILENO);
+
+    execv(file, (char *const *)argv);
+
+    _exit(1);
+  }
+
+  close(link[1]);
+
+  size_t capacity = 4096 > max_len ? max_len : 4096;
+  size_t length = 0;
+  bool truncated = false;
+  char *output = malloc(capacity);
+
+  while (output) {
+    if (length + 1 >= capacity) {
+      if (capacity >= max_len) {
+        truncated = true;
+
+        break;
+      }
+
+      size_t new_capacity = capacity * 2 > max_len ? max_len : capacity * 2;
+      char *new_output = realloc(output, new_capacity);
+      if (!new_output) {
+        free(output);
+        output = NULL;
+
+        break;
+      }
+
+      output = new_output;
+      capacity = new_capacity;
+    }
+
+    ssize_t nbytes = read(link[0], output + length, capacity - length - 1);
+    if (nbytes == -1 && errno == EINTR) continue;
+    if (nbytes <= 0) break;
+
+    length += (size_t)nbytes;
+  }
+
+  close(link[0]);
+
+  int status = 0;
+  while (waitpid(pid, &status, 0) == -1 && errno == EINTR);
+
+  if (!output) {
+    LOGE("Failed to allocate memory for command output");
+
+    return NULL;
+  }
+
+  /* INFO: Partial output is worse than none: callers would cache incomplete data. */
+  if (truncated) {
+    LOGE("Output of %s exceeded %zu bytes", file, max_len);
+
+    free(output);
+
+    return NULL;
+  }
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    LOGE("Command %s exited with status %d", file, status);
+
+    free(output);
+
+    return NULL;
+  }
+
+  output[length] = '\0';
+
+  return output;
+}
+
+bool is_umount_disabled(void) {
+  static int disabled = -1;
+  if (disabled == -1) disabled = access(UMOUNT_DISABLED_FILE, F_OK) == 0;
+
+  return disabled == 1;
+}
+
+void file_stamp_get(const char *restrict path, struct file_stamp *restrict stamp) {
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    memset(stamp, 0, sizeof(*stamp));
+
+    return;
+  }
+
+  stamp->exists = true;
+  stamp->ino = st.st_ino;
+  stamp->size = st.st_size;
+  stamp->mtime = st.st_mtim;
+}
+
+bool file_stamp_equal(const struct file_stamp *a, const struct file_stamp *b) {
+  return a->exists == b->exists && a->ino == b->ino && a->size == b->size &&
+         a->mtime.tv_sec == b->mtime.tv_sec && a->mtime.tv_nsec == b->mtime.tv_nsec;
 }
 
 /* INFO: Cannot use restrict here as execv does not have restrict */
@@ -668,21 +794,63 @@ bool parse_mountinfo(const char *restrict pid, struct mountinfos *restrict mount
   return true;
 }
 
-/* INFO: Paths whose mount must never be detached, even when they look like
-           root mounts.
+/* INFO: Reads the user's extra umount paths (CUSTOM_UMOUNT_LIST_FILE). Returns how many
+           were read; each entry must be freed by the caller. A missing file is not an error. */
+static size_t read_custom_umount_list(char **paths, size_t max) {
+  FILE *list = fopen(CUSTOM_UMOUNT_LIST_FILE, "r");
+  if (!list) return 0;
+
+  size_t count = 0;
+  char line[PATH_MAX];
+  while (count < max && fgets(line, sizeof(line), list)) {
+    char *start = line;
+    while (*start == ' ' || *start == '\t') start++;
+
+    char *end = start + strlen(start);
+    while (end > start && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
+    *end = '\0';
+
+    /* INFO: Only absolute paths; empty lines and comments are skipped. */
+    if (*start != '/') continue;
+
+    paths[count] = strdup(start);
+    if (paths[count] == NULL) break;
+
+    count++;
+  }
+
+  fclose(list);
+
+  return count;
+}
+
+/* INFO: true when target is one of the listed paths or below one of them. */
+static bool is_custom_umount_target(const char *target, char **paths, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    size_t len = strlen(paths[i]);
+    if (strncmp(target, paths[i], len) != 0) continue;
+
+    if (target[len] == '\0' || target[len] == '/') return true;
+  }
+
+  return false;
+}
+
+/* INFO: Mounts that must never be detached, even when they look like root
+           mounts.
 
            umount2(MNT_DETACH) removes the whole subtree under the target, not
              just that one mount. On ColorOS the storage tree
-             (/mnt/runtime, /storage/emulated, /mnt/user and their children) is set up inside
-             the same namespace, and several of its entries carry a source or
-             root that matches the root-solution check below. Detaching any of
-             them tore down the storage subtree, which is exactly the "storage
-             temporarily unavailable" breakage: MediaProvider and the storage
-             manager lost their mounts.
+             (/mnt/runtime, /storage/emulated, /mnt/user and their children) is
+             built inside the same namespace, and several of its entries carry a
+             source or root that matches the root-solution check below. Detaching
+             any of them tore down the storage subtree, which shows up as the
+             storage manager and file manager losing their view of external
+             storage.
 
-           These prefixes cover the storage tree and the basic system mounts a
-             process cannot survive without. Anything else is still unmounted,
-             so root hiding keeps working.
+           These prefixes cover the storage tree and the system mounts a process
+             cannot survive without. Everything else is still unmounted, so the
+             root unmount feature keeps working.
 */
 static const char *const protected_mount_prefixes[] = {
   "/mnt/runtime", "/mnt/user", "/mnt/expand", "/storage",
@@ -695,12 +863,11 @@ static bool is_protected_mount(const char *target) {
   for (size_t i = 0; i < sizeof(protected_mount_prefixes) / sizeof(protected_mount_prefixes[0]); i++) {
     size_t len = strlen(protected_mount_prefixes[i]);
 
-    if (strncmp(target, protected_mount_prefixes[i], len) == 0) {
-      /* INFO: Require a path boundary so "/storage" does not also protect
-                 "/storageX". A trailing slash in the table covers the exact
-                 path itself. */
-      if (target[len] == '\0' || target[len] == '/') return true;
-    }
+    if (strncmp(target, protected_mount_prefixes[i], len) != 0) continue;
+
+    /* INFO: Require a path boundary so "/storage" does not also match
+               "/storageX". */
+    if (target[len] == '\0' || target[len] == '/') return true;
   }
 
   return false;
@@ -726,6 +893,9 @@ bool umount_root(struct root_impl impl) {
   char **targets_to_unmount = NULL;
   size_t num_targets = 0;
 
+  char *custom_paths[CUSTOM_UMOUNT_LIST_MAX];
+  size_t num_custom = read_custom_umount_list(custom_paths, CUSTOM_UMOUNT_LIST_MAX);
+
   for (size_t i = 0; i < mounts.length; i++) {
     struct mountinfo mount = mounts.mounts[i];
 
@@ -733,11 +903,13 @@ bool umount_root(struct root_impl impl) {
     if (strcmp(mount.source, source_name) == 0 || (impl.impl == Magisk && strcmp(mount.source, "worker") == 0)) should_unmount = true;
     if (strncmp(mount.target, "/data/adb/modules", strlen("/data/adb/modules")) == 0) should_unmount = true;
     if (strncmp(mount.root, "/adb/modules/", strlen("/adb/modules/")) == 0) should_unmount = true;
+    /* INFO: Mounts the user listed, such as a ROM's own bind mounts over system files. */
+    if (num_custom > 0 && is_custom_umount_target(mount.target, custom_paths, num_custom)) should_unmount = true;
 
     if (!should_unmount) continue;
 
     /* INFO: Never detach storage or system mounts - the subtree would go with
-               them and the app would lose its external storage view. */
+               them and the process would lose its external storage view. */
     if (is_protected_mount(mount.target)) {
       LOGI("[%s] Skipping protected mount %s", source_name, mount.target);
 
@@ -749,6 +921,8 @@ bool umount_root(struct root_impl impl) {
       LOGE("[%s] Failed to allocate memory for targets_to_unmount", source_name);
 
       free(targets_to_unmount);
+
+      for (size_t j = 0; j < num_custom; j++) free(custom_paths[j]);
 
       free_mounts(&mounts);
 
@@ -773,6 +947,8 @@ bool umount_root(struct root_impl impl) {
   }
 
   free(targets_to_unmount);
+
+  for (size_t i = 0; i < num_custom; i++) free(custom_paths[i]);
 
   free_mounts(&mounts);
 
@@ -818,7 +994,9 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
       goto finalize_mns_fork;
     }
 
-    if (mns_state == Clean) {
+    /* INFO: With unmount disabled by the user, the "clean" namespace is the app's own
+               one, untouched: another module is expected to hide root mounts. */
+    if (mns_state == Clean && !is_umount_disabled()) {
       unshare(CLONE_NEWNS);
 
       if (!umount_root(impl)) {
