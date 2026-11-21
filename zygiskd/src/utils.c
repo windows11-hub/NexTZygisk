@@ -7,7 +7,6 @@
 #include <poll.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -178,9 +177,7 @@ int unix_listener_from_path(const char *restrict path) {
     return -1;
   }
 
-  /* INFO: CLOEXEC so companions never inherit the listener: otherwise connect()
-             still succeeds after ReZygiskd died and clients hang forever. */
-  int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (socket_fd == -1) {
     LOGE("socket: %s", strerror(errno));
 
@@ -200,8 +197,7 @@ int unix_listener_from_path(const char *restrict path) {
     return -1;
   }
 
-  /* INFO: Every app launch queues here, keep the backlog wide for boot bursts. */
-  if (listen(socket_fd, SOMAXCONN) == -1) {
+  if (listen(socket_fd, 2) == -1) {
     LOGE("listen: %s", strerror(errno));
 
     close(socket_fd);
@@ -351,131 +347,9 @@ ssize_t read_string(int fd, char *restrict buf, size_t buf_size) {
     return -1;
   }
 
-  /* INFO: Terminate empty strings too, callers use buf right away. */
-  buf[str_len] = '\0';
+  if (str_len > 0) buf[str_len] = '\0';
 
   return read_bytes;
-}
-
-char *exec_command_output(const char *restrict file, const char *const argv[], size_t max_len) {
-  int link[2];
-  if (pipe2(link, O_CLOEXEC) == -1) {
-    LOGE("pipe2: %s", strerror(errno));
-
-    return NULL;
-  }
-
-  pid_t pid = fork();
-  if (pid == -1) {
-    LOGE("fork: %s", strerror(errno));
-
-    close(link[0]);
-    close(link[1]);
-
-    return NULL;
-  }
-
-  if (pid == 0) {
-    /* INFO: dup2 clears O_CLOEXEC on the new descriptor. */
-    dup2(link[1], STDOUT_FILENO);
-
-    execv(file, (char *const *)argv);
-
-    _exit(1);
-  }
-
-  close(link[1]);
-
-  size_t capacity = 4096 > max_len ? max_len : 4096;
-  size_t length = 0;
-  bool truncated = false;
-  char *output = malloc(capacity);
-
-  while (output) {
-    if (length + 1 >= capacity) {
-      if (capacity >= max_len) {
-        truncated = true;
-
-        break;
-      }
-
-      size_t new_capacity = capacity * 2 > max_len ? max_len : capacity * 2;
-      char *new_output = realloc(output, new_capacity);
-      if (!new_output) {
-        free(output);
-        output = NULL;
-
-        break;
-      }
-
-      output = new_output;
-      capacity = new_capacity;
-    }
-
-    ssize_t nbytes = read(link[0], output + length, capacity - length - 1);
-    if (nbytes == -1 && errno == EINTR) continue;
-    if (nbytes <= 0) break;
-
-    length += (size_t)nbytes;
-  }
-
-  close(link[0]);
-
-  int status = 0;
-  while (waitpid(pid, &status, 0) == -1 && errno == EINTR);
-
-  if (!output) {
-    LOGE("Failed to allocate memory for command output");
-
-    return NULL;
-  }
-
-  /* INFO: Partial output is worse than none: callers would cache incomplete data. */
-  if (truncated) {
-    LOGE("Output of %s exceeded %zu bytes", file, max_len);
-
-    free(output);
-
-    return NULL;
-  }
-
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    LOGE("Command %s exited with status %d", file, status);
-
-    free(output);
-
-    return NULL;
-  }
-
-  output[length] = '\0';
-
-  return output;
-}
-
-bool is_umount_disabled(void) {
-  static int disabled = -1;
-  if (disabled == -1) disabled = access(UMOUNT_DISABLED_FILE, F_OK) == 0;
-
-  return disabled == 1;
-}
-
-void file_stamp_get(const char *restrict path, struct file_stamp *restrict stamp) {
-  struct stat st;
-  if (stat(path, &st) != 0) {
-    memset(stamp, 0, sizeof(*stamp));
-
-    return;
-  }
-
-  stamp->exists = true;
-  stamp->ino = st.st_ino;
-  stamp->size = st.st_size;
-  stamp->mtime = st.st_mtim;
-}
-
-bool file_stamp_equal(const struct file_stamp *a, const struct file_stamp *b) {
-  return a->exists == b->exists && a->ino == b->ino && a->size == b->size &&
-         a->mtime.tv_sec == b->mtime.tv_sec && a->mtime.tv_nsec == b->mtime.tv_nsec;
 }
 
 /* INFO: Cannot use restrict here as execv does not have restrict */
@@ -794,178 +668,35 @@ bool parse_mountinfo(const char *restrict pid, struct mountinfos *restrict mount
   return true;
 }
 
+/* INFO: Paths whose mount must never be detached, even when they look like
+           root mounts.
 
-bool umount_root(struct root_impl impl) {
-  /* INFO: Unmounting is DISABLED in this fork.
-  
-           The original implementation parsed /proc/self/mountinfo and called
-             umount2(target, MNT_DETACH) on every mount whose source matched the
-             root solution name, plus anything under /data/adb/modules and
-             /adb/modules/. On ColorOS builds this detached the storage subtree
-             as well (the storage manager / file manager lost its mount view),
-             because the storage mounts share the namespace and MNT_DETACH
-             removes the whole subtree, not just the root overlay.
+           umount2(MNT_DETACH) removes the whole subtree under the target, not
+             just that one mount. On ColorOS the storage tree
+             (/mnt/runtime/*, /storage/emulated/*, /mnt/user/*) is set up inside
+             the same namespace, and several of its entries carry a source or
+             root that matches the root-solution check below. Detaching any of
+             them tore down the storage subtree, which is exactly the "storage
+             temporarily unavailable" breakage: MediaProvider and the storage
+             manager lost their mounts.
 
-           We therefore do nothing here and return success, so the caller keeps
-             the "clean" mount namespace (a private copy made with unshare) but
-             does not actually detach anything from it.
+           These prefixes cover the storage tree and the basic system mounts a
+             process cannot survive without. Anything else is still unmounted,
+             so root hiding keeps working.
+*/
+static const char *const protected_mount_prefixes[] = {
+  "/mnt/runtime", "/mnt/user", "/mnt/expand", "/storage",
+  "/mnt/media_rw", "/mnt/pass_through", "/mnt/installer",
+  "/system", "/vendor", "/product", "/system_ext", "/odm", "/apex",
+  "/data/user", "/data/user_de", "/data/data", "/data/media"
+};
 
-           Consequence: root mounts stay visible to denylisted processes. Hiding
-             must be provided by the root manager (KernelSU/APatch "umount
-             modules" per-app profile) or by a Zygisk hiding module.
-  */
-  (void)impl;
+static bool is_protected_mount(const char *target) {
+  for (size_t i = 0; i < sizeof(protected_mount_prefixes) / sizeof(protected_mount_prefixes[0]); i++) {
+    size_t len = strlen(protected_mount_prefixes[i]);
 
-  LOGI("umount_root: disabled in this fork, nothing was unmounted");
-
-  return true;
-}
-
-int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl impl) {
-  static int clean_namespace_fd = -1;
-  static int mounted_namespace_fd = -1;
-
-  /* INFO: Unmounting is disabled in this fork (see umount_root), so the root
-             impl is no longer consulted here. The parameter is kept for API
-             stability and cast to void to silence -Wunused-parameter, which
-             the build promotes to an error (-Werror). Declared after the
-             declarations above so -Wpedantic does not complain about a
-             statement preceding a declaration.
-  */
-  (void)impl;
-
-  if (mns_state == Clean && clean_namespace_fd != -1) return clean_namespace_fd;
-  if (mns_state == Mounted && mounted_namespace_fd != -1) return mounted_namespace_fd;
-
-  int sockets[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == -1) {
-    LOGE("socketpair: %s", strerror(errno));
-
-    return -1;
-  }
-
-  int socket_parent = sockets[0];
-  int socket_child = sockets[1];
-
-  pid_t fork_pid = fork();
-  if (fork_pid < 0) {
-    LOGE("fork: %s", strerror(errno));
-
-    close(socket_parent);
-    close(socket_child);
-
-    return -1;
-  }
-
-  if (fork_pid == 0) {
-    close(socket_parent);
-
-    if (switch_mount_namespace(pid) == false) {
-      LOGE("Failed to switch mount namespace");
-
-      if (write_uint8_t(socket_child, 0) == -1)
-        LOGE("Failed to write to socket_child: %s", strerror(errno));
-
-      goto finalize_mns_fork;
-    }
-
-    /* INFO: Unmounting is disabled in this fork (see umount_root), so entering
-               the "clean" namespace now buys nothing and costs correctness.
-
-           What it would cost: unshare() snapshots the mount table at this very
-             instant, but zygote only creates the app's external-storage bind
-             mounts after specialisation, from mount_external. A process that is
-             switched into the snapshot later finds /storage and /mnt/user
-             present but without the mounts its UID needs - the storage manager
-             and file manager then report broken storage.
-
-           Since this fork never detaches the root overlays, the snapshot would
-             be identical to the Zygote namespace except for those missing mounts,
-             so there is nothing to gain. We therefore keep the Zygote namespace
-             untouched for every process.
-
-           Root hiding must come from the root manager's own per-app "umount
-             modules" profile or from a dedicated hiding module - the same
-             arrangement the README already documents for
-             /data/adb/nextzygisk/umount_disabled. That switch keeps working: it
-             only ever suppressed this same path.
-    */
-
-    if (write_uint8_t(socket_child, 1) == -1) {
-      LOGE("Failed to write to socket_child: %s", strerror(errno));
-
-      close(socket_child);
-
-      _exit(1);
-    }
-
-    uint8_t has_opened = 0;
-    if (read_uint8_t(socket_child, &has_opened) == -1)
-      LOGE("Failed to read from socket_child: %s", strerror(errno));
-
-    finalize_mns_fork:
-      close(socket_child);
-
-      _exit(0);
-  }
-
-  close(socket_child);
-
-  uint8_t has_succeeded = 0;
-  if (read_uint8_t(socket_parent, &has_succeeded) == -1) {
-    LOGE("Failed to read from socket_parent: %s", strerror(errno));
-
-    close(socket_parent);
-
-    return -1;
-  }
-
-  if (!has_succeeded) {
-    LOGE("Failed to umount root");
-
-    close(socket_parent);
-
-    return -1;
-  }
-
-  char ns_path[PATH_MAX];
-  snprintf(ns_path, PATH_MAX, "/proc/%d/ns/mnt", fork_pid);
-
-  int ns_fd = open(ns_path, O_RDONLY);
-  if (ns_fd == -1) {
-    LOGE("open: %s", strerror(errno));
-
-    close(socket_parent);
-
-    return -1;
-  }
-
-  uint8_t opened_signal = 1;
-  if (write_uint8_t(socket_parent, opened_signal) == -1) {
-    LOGE("Failed to write to socket_parent: %s", strerror(errno));
-
-    close(ns_fd);
-    close(socket_parent);
-
-    return -1;
-  }
-
-  if (close(socket_parent) == -1) {
-    LOGE("Failed to close socket_parent: %s", strerror(errno));
-
-    close(ns_fd);
-
-    return -1;
-  }
-
-  if (waitpid(fork_pid, NULL, 0) == -1) {
-    LOGE("waitpid: %s", strerror(errno));
-
-    return -1;
-  }
-
-  if (mns_state == Clean) clean_namespace_fd = ns_fd;
-  else if (mns_state == Mounted) mounted_namespace_fd = ns_fd;
-
-  return ns_fd;
-}
+    if (strncmp(target, protected_mount_prefixes[i], len) == 0) {
+      /* INFO: Require a path boundary so "/storage" does not also protect
+                 "/storageX". A trailing slash in the table covers the exact
+                 path itself. */
+      if (target[len] == '
