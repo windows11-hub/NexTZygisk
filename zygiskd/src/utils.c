@@ -739,7 +739,7 @@ bool umount_root(struct root_impl impl) {
     /* INFO: Never detach storage or system mounts - the subtree would go with
                them and the app would lose its external storage view. */
     if (is_protected_mount(mount.target)) {
-      LOGD("[%s] Skipping protected mount %s", source_name, mount.target);
+      LOGI("[%s] Skipping protected mount %s", source_name, mount.target);
 
       continue;
     }
