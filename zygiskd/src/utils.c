@@ -673,7 +673,7 @@ bool parse_mountinfo(const char *restrict pid, struct mountinfos *restrict mount
 
            umount2(MNT_DETACH) removes the whole subtree under the target, not
              just that one mount. On ColorOS the storage tree
-             (/mnt/runtime/*, /storage/emulated/*, /mnt/user/*) is set up inside
+             (/mnt/runtime, /storage/emulated, /mnt/user and their children) is set up inside
              the same namespace, and several of its entries carry a source or
              root that matches the root-solution check below. Detaching any of
              them tore down the storage subtree, which is exactly the "storage
@@ -699,4 +699,213 @@ static bool is_protected_mount(const char *target) {
       /* INFO: Require a path boundary so "/storage" does not also protect
                  "/storageX". A trailing slash in the table covers the exact
                  path itself. */
-      if (target[len] == '
+      if (target[len] == '\0' || target[len] == '/') return true;
+    }
+  }
+
+  return false;
+}
+
+bool umount_root(struct root_impl impl) {
+  /* INFO: We are already in the target pid mount namespace, so actually,
+             when we use self here, we meant its pid.
+  */
+  struct mountinfos mounts;
+  if (!parse_mountinfo("self", &mounts)) {
+    LOGE("Failed to parse mountinfo");
+
+    return false;
+  }
+
+  const char *source_name = "magisk";
+  if (impl.impl == KernelSU) source_name = "KSU";
+  else if (impl.impl == APatch) source_name = "APatch";
+
+  LOGI("[%s] Unmounting root", source_name);
+
+  char **targets_to_unmount = NULL;
+  size_t num_targets = 0;
+
+  for (size_t i = 0; i < mounts.length; i++) {
+    struct mountinfo mount = mounts.mounts[i];
+
+    bool should_unmount = false;
+    if (strcmp(mount.source, source_name) == 0 || (impl.impl == Magisk && strcmp(mount.source, "worker") == 0)) should_unmount = true;
+    if (strncmp(mount.target, "/data/adb/modules", strlen("/data/adb/modules")) == 0) should_unmount = true;
+    if (strncmp(mount.root, "/adb/modules/", strlen("/adb/modules/")) == 0) should_unmount = true;
+
+    if (!should_unmount) continue;
+
+    /* INFO: Never detach storage or system mounts - the subtree would go with
+               them and the app would lose its external storage view. */
+    if (is_protected_mount(mount.target)) {
+      LOGD("[%s] Skipping protected mount %s", source_name, mount.target);
+
+      continue;
+    }
+
+    char **tmp_targets = realloc(targets_to_unmount, (num_targets + 1) * sizeof(char*));
+    if (tmp_targets == NULL) {
+      LOGE("[%s] Failed to allocate memory for targets_to_unmount", source_name);
+
+      free(targets_to_unmount);
+
+      free_mounts(&mounts);
+
+      return false;
+    }
+    targets_to_unmount = tmp_targets;
+
+    num_targets++;
+
+    targets_to_unmount[num_targets - 1] = mount.target;
+  }
+
+  for (size_t i = num_targets; i > 0; i--) {
+    const char *target = targets_to_unmount[i - 1];
+    if (umount2(target, MNT_DETACH) == -1) {
+      LOGE("[%s] Failed to unmount %s: %s", source_name, target, strerror(errno));
+
+      continue;
+    }
+
+    LOGI("[%s] Unmounted %s", source_name, target);
+  }
+
+  free(targets_to_unmount);
+
+  free_mounts(&mounts);
+
+  return true;
+}
+
+int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl impl) {
+  static int clean_namespace_fd = -1;
+  static int mounted_namespace_fd = -1;
+
+  if (mns_state == Clean && clean_namespace_fd != -1) return clean_namespace_fd;
+  if (mns_state == Mounted && mounted_namespace_fd != -1) return mounted_namespace_fd;
+
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == -1) {
+    LOGE("socketpair: %s", strerror(errno));
+
+    return -1;
+  }
+
+  int socket_parent = sockets[0];
+  int socket_child = sockets[1];
+
+  pid_t fork_pid = fork();
+  if (fork_pid < 0) {
+    LOGE("fork: %s", strerror(errno));
+
+    close(socket_parent);
+    close(socket_child);
+
+    return -1;
+  }
+
+  if (fork_pid == 0) {
+    close(socket_parent);
+
+    if (switch_mount_namespace(pid) == false) {
+      LOGE("Failed to switch mount namespace");
+
+      if (write_uint8_t(socket_child, 0) == -1)
+        LOGE("Failed to write to socket_child: %s", strerror(errno));
+
+      goto finalize_mns_fork;
+    }
+
+    if (mns_state == Clean) {
+      unshare(CLONE_NEWNS);
+
+      if (!umount_root(impl)) {
+        LOGE("Failed to umount root");
+
+        if (write_uint8_t(socket_child, 0) == -1)
+          LOGE("Failed to write to socket_child: %s", strerror(errno));
+
+        goto finalize_mns_fork;
+      }
+    }
+
+    if (write_uint8_t(socket_child, 1) == -1) {
+      LOGE("Failed to write to socket_child: %s", strerror(errno));
+
+      close(socket_child);
+
+      _exit(1);
+    }
+
+    uint8_t has_opened = 0;
+    if (read_uint8_t(socket_child, &has_opened) == -1)
+      LOGE("Failed to read from socket_child: %s", strerror(errno));
+
+    finalize_mns_fork:
+      close(socket_child);
+
+      _exit(0);
+  }
+
+  close(socket_child);
+
+  uint8_t has_succeeded = 0;
+  if (read_uint8_t(socket_parent, &has_succeeded) == -1) {
+    LOGE("Failed to read from socket_parent: %s", strerror(errno));
+
+    close(socket_parent);
+
+    return -1;
+  }
+
+  if (!has_succeeded) {
+    LOGE("Failed to umount root");
+
+    close(socket_parent);
+
+    return -1;
+  }
+
+  char ns_path[PATH_MAX];
+  snprintf(ns_path, PATH_MAX, "/proc/%d/ns/mnt", fork_pid);
+
+  int ns_fd = open(ns_path, O_RDONLY);
+  if (ns_fd == -1) {
+    LOGE("open: %s", strerror(errno));
+
+    close(socket_parent);
+
+    return -1;
+  }
+
+  uint8_t opened_signal = 1;
+  if (write_uint8_t(socket_parent, opened_signal) == -1) {
+    LOGE("Failed to write to socket_parent: %s", strerror(errno));
+
+    close(ns_fd);
+    close(socket_parent);
+
+    return -1;
+  }
+
+  if (close(socket_parent) == -1) {
+    LOGE("Failed to close socket_parent: %s", strerror(errno));
+
+    close(ns_fd);
+
+    return -1;
+  }
+
+  if (waitpid(fork_pid, NULL, 0) == -1) {
+    LOGE("waitpid: %s", strerror(errno));
+
+    return -1;
+  }
+
+  if (mns_state == Clean) clean_namespace_fd = ns_fd;
+  else if (mns_state == Mounted) mounted_namespace_fd = ns_fd;
+
+  return ns_fd;
+}
