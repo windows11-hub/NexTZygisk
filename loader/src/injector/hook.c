@@ -400,7 +400,32 @@ static void hook_unloader(void);
    - https://github.com/aosp-mirror/platform_frameworks_base/blob/1cdfff555f4a21f71ccc978290e2e212e2f8b168/core/jni/AndroidRuntime.cpp#L791
 */
 DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *default_value) {
-  hook_unloader();
+  /* INFO: Run the art/libart setup exactly once.
+
+           This hook fires for every property read during startup. The comment
+             above always said the extra calls would be ignored, but nothing did
+             that: hook_unloader() ran again on every call, which meant
+             plti_add_lib + PLT_HOOK_REGISTER were re-applied to libart.so and
+             load_modules_only() re-read the module list and re-loaded every
+             module through csoloader.
+
+           Re-registering a PLT hook that is already installed, and re-loading a
+             module whose library is already mapped, corrupts the hook list and
+             the module handles: the modules end up half-initialised. In practice
+             that is what stopped LSPosed from injecting - its parasitic manager
+             window never appeared and its settings app could not read the module
+             list.
+
+           A one-shot flag matches what the comment describes and keeps the hook
+             in place for the single transition we actually need.
+  */
+  static bool art_setup_done = false;
+
+  if (!art_setup_done) {
+    art_setup_done = true;
+
+    hook_unloader();
+  }
 
   return old_property_get(key, value, default_value);
 }
