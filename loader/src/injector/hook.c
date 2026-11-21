@@ -193,40 +193,41 @@ static void jni_hook_list_add(const char *class_name, JNINativeMethod *methods, 
   jni_hook_list_count++;
 }
 
-/* INFO: Mount-namespace switching is disabled in this fork.
-
-           This is the function that actually moved a process into the saved
-             "clean" namespace, and it is what broke external storage:
-
-               1. save_mns_fd() forks, setns()es into the target, unshare()s a
-                  copy and hands the copy back. That copy is a snapshot taken
-                  during specialisation, before zygote creates the app's
-                  external-storage bind mounts from mount_external.
-               2. update_mnt_ns() then setns()es the app into that snapshot, so
-                  /storage and /mnt/user exist without the mounts the app's UID
-                  needs. The storage manager and file manager see broken storage.
-               3. Point 1 no longer applies (the unshare was removed), so the
-                  snapshot is now identical to the Zygote namespace - switching
-                  to it accomplishes nothing while still costing a setns per app
-                  launch and leaving the door open to the same class of bug.
-
-           Staying in the Zygote namespace keeps the storage tree complete.
-             Hiding the module overlays is the job of KernelSU's kernel-side
-             unmount (which this fork leaves disabled, see kernelsu.c), a Zygisk
-             hiding module (Shamiko / Treat Wheel), or NextSUSFS.
-
-           The daemon is still told about the request on the dry-run path so the
-           WebUI keeps reporting a coherent state, but nothing is ever switched.
-*/
 static bool update_mnt_ns(enum mount_namespace_state mns_state, bool dry_run) {
-  (void)dry_run;
+  char ns_path[PATH_MAX];
+  if (!rezygiskd_update_mns(mns_state, ns_path, sizeof(ns_path))) {
+    PLOGE("Failed to update mount namespace");
 
-  LOGD("mount namespace switching is disabled, leaving %s untouched",
-       mns_state == Clean ? "clean view" : "mounted view");
+    return false;
+  }
+
+  if (dry_run) return true;
+
+  int updated_ns = open(ns_path, O_RDONLY);
+  if (updated_ns == -1) {
+    PLOGE("Failed to open mount namespace [%s]", ns_path);
+
+    return false;
+  }
+
+  char *mns_state_str = "unknown";
+  if (mns_state == Clean) mns_state_str = "clean";
+  if (mns_state == Mounted) mns_state_str = "mounted";
+
+  LOGD("set mount namespace to [%s] fd=[%d]: %s", ns_path, updated_ns, mns_state_str);
+
+  if (setns(updated_ns, CLONE_NEWNS) == -1) {
+    PLOGE("Failed to set mount namespace [%s]", ns_path);
+
+    close(updated_ns);
+
+    return false;
+  }
+
+  close(updated_ns);
 
   return true;
 }
-
 /* INFO: Hook function declarations */
 #define DCL_HOOK_FUNC(ret, func, ...) \
   ret (*old_##func)(__VA_ARGS__);     \
@@ -280,37 +281,8 @@ DCL_HOOK_FUNC(void, _ZNK18FileDescriptorInfo14ReopenOrDetach, void *_this, void 
   if (strncmp(file_path, "/memfd:/boot-image-methods.art", strlen("/memfd:/boot-image-methods.art")) == 0)
     goto bypass_fd_check;
 
-  /* INFO: Only detach descriptors that belong to the root solution.
-
-           The original upstream hook detaches ANY descriptor whose path is not
-             currently accessible. That is far too broad: external storage paths
-             (/storage/emulated/..., /mnt/user/...) are not resolvable until vold
-             has finished mounting the volume and MediaProvider is up, so a
-             zygote fork that races that window had its storage descriptors
-             closed here. The forked app then reported "storage temporarily
-             unavailable" - the breakage this fork is fixing.
-
-           Zygote's own ReopenOrDetach already handles a missing path correctly
-             (it reopens or detaches per its own rules), so the safest change is
-             to stop pre-filtering entirely and let it decide. We keep the hook
-             only to detach descriptors that point into the root solution itself,
-             which is the case it was written for.
-  */
-  static const char *const root_tool_roots[] = {
-    "/data/adb/", "/data/adb/modules/", "/debug_ramdisk/", "/sbin/"
-  };
-
-  bool is_root_tool_path = false;
-  for (size_t i = 0; i < sizeof(root_tool_roots) / sizeof(root_tool_roots[0]); i++) {
-    if (strncmp(file_path, root_tool_roots[i], strlen(root_tool_roots[i])) == 0) {
-      is_root_tool_path = true;
-
-      break;
-    }
-  }
-
-  if (is_root_tool_path && access(file_path, F_OK) == -1) {
-    LOGD("Failed to open root-tool file %s, detaching it", file_path);
+  if (access(file_path, F_OK) == -1) {
+    LOGD("Failed to open file %s, detaching it", file_path);
 
     close(fd);
 
@@ -320,7 +292,6 @@ DCL_HOOK_FUNC(void, _ZNK18FileDescriptorInfo14ReopenOrDetach, void *_this, void 
   bypass_fd_check:
     old__ZNK18FileDescriptorInfo14ReopenOrDetach(_this, fail_fn);
 }
-
 static void unhook_functions(void);
 /* INFO: Self-unloading is not a direct task, it requires the utilization of tail
            optimization, which requires the signature to be the same as munmap, or
@@ -385,7 +356,7 @@ DCL_HOOK_FUNC(char *, strdup, const char *str) {
   return old_strdup(str);
 }
 
-static bool hook_unloader(void);
+static void hook_unloader(void);
 /*
   INFO: Our goal is to get called after libart.so is loaded, but before ART actually starts running.
           If we are too early, we won't find libart.so in maps, and if we are too late, we could make other
@@ -400,34 +371,7 @@ static bool hook_unloader(void);
    - https://github.com/aosp-mirror/platform_frameworks_base/blob/1cdfff555f4a21f71ccc978290e2e212e2f8b168/core/jni/AndroidRuntime.cpp#L791
 */
 DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *default_value) {
-  /* INFO: Run the art/libart setup exactly once.
-
-           This hook fires for every property read during startup. The comment
-             above always said the extra calls would be ignored, but nothing did
-             that: hook_unloader() ran again on every call, which meant
-             plti_add_lib + PLT_HOOK_REGISTER were re-applied to libart.so and
-             load_modules_only() re-read the module list and re-loaded every
-             module through csoloader.
-
-           Re-registering a PLT hook that is already installed, and re-loading a
-             module whose library is already mapped, corrupts the hook list and
-             the module handles: the modules end up half-initialised. In practice
-             that is what stopped LSPosed from injecting - its parasitic manager
-             window never appeared and its settings app could not read the module
-             list.
-
-           The latch is set only after hook_unloader() reports success. Latching
-             first and then calling (the previous attempt at this fix) was wrong:
-             hook_unloader() bails out when libart.so is not mapped yet, which is
-             the normal case for the earliest property reads, and the flag then
-             prevented every later retry - Zygisk never loaded its modules at all,
-             which is why injection failed outright on some boots.
-  */
-  static bool art_setup_done = false;
-
-  if (!art_setup_done && hook_unloader()) {
-    art_setup_done = true;
-  }
+  hook_unloader();
 
   return old_property_get(key, value, default_value);
 }
@@ -1545,21 +1489,11 @@ void hook_functions(void) {
   PLT_HOOK_REGISTER_SYM("libandroid_runtime.so", "_ZNK18FileDescriptorInfo14ReopenOrDetach", _ZNK18FileDescriptorInfo14ReopenOrDetach, true);
 }
 
-/* INFO: Returns true only when the libart transition really happened.
-
-           The caller must not latch itself on a failed attempt: this hook runs on
-             the first property read that happens after libandroid_runtime is
-             loaded, which may well be BEFORE libart.so is mapped. Upstream simply
-             ran the whole body on every call, so an early failure was retried on
-             the next property read.
-
-           Returning a status makes that retry explicit instead of accidental.
-*/
-static bool hook_unloader(void) {
+static void hook_unloader(void) {
   if (!plti_add_lib(&plti_ctx, "libart.so")) {
     LOGE("Failed to add libart.so to PLTI");
 
-    return false;
+    return;
   }
 
   PLT_HOOK_REGISTER("libart.so", pthread_attr_setstacksize, false);
@@ -1569,15 +1503,10 @@ static bool hook_unloader(void) {
   /* INFO: Load modules early on (before system server fork) to spread through all Zygotes */
   if (!load_modules_only()) {
     LOGE("Failed to load modules in hook_unloader");
-
-    return false;
   }
 
   LOGD("ReZygisk unloader hooked successfully");
-
-  return true;
 }
-
 static void unhook_functions(void) {
   PLT_HOOK_UNREGISTER("libandroid_runtime.so", fork, false);
   PLT_HOOK_UNREGISTER("libandroid_runtime.so", strdup, false);
