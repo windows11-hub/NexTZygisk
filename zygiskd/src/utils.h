@@ -127,4 +127,9 @@ void stringify_root_impl_name(struct root_impl impl, char *restrict output);
 
 int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl impl);
 
+/* INFO: Drops the namespaces captured earlier, so the next request rebuilds them
+           from the system that is running now. Called when zygote is restarted: the
+           captured fds then describe mount trees that no longer exist. */
+void save_mns_fd_reset(void);
+
 #endif /* UTILS_H */
