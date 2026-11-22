@@ -437,6 +437,17 @@ void zygiskd_start(char *restrict argv[]) {
           context.modules[i].companion = -1;
         }
 
+        /* INFO: Zygote is about to be replaced, and with it every mount namespace
+                   this daemon captured.
+
+                 This process outlives a soft reboot, so without dropping them the
+                   next request would be answered with a mount tree from the
+                   previous boot - one whose per-user binds and /data/app mounts are
+                   gone. A process setns'd into that tree cannot load its own dex or
+                   resources, which is what crashed System UI after a soft reboot.
+        */
+        save_mns_fd_reset();
+
         break;
       }
       case GetProcessFlags: {
