@@ -3,6 +3,7 @@
 #include <time.h>
 #include <errno.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
 
@@ -12,7 +13,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <fcntl.h>
 
 #include "daemon.h"
 #include "socket_utils.h"
@@ -440,24 +440,54 @@ void rezygiskd_listener_stop() {
 
 #define MAX_RETRY_COUNT 5
 
-#define CREATE_ZYGOTE_START_COUNTER(abi)             \
-  struct timespec last_zygote##abi = {               \
-    .tv_sec = 0,                                     \
-    .tv_nsec = 0                                     \
-  };                                                 \
-                                                     \
-  int count_zygote ## abi = 0;                       \
-  bool should_stop_inject ## abi() {                 \
-    struct timespec now = {};                        \
-    clock_gettime(CLOCK_MONOTONIC, &now);            \
-    if (now.tv_sec - last_zygote ## abi.tv_sec < 30) \
-      count_zygote ## abi++;                         \
-    else                                             \
-      count_zygote ## abi = 0;                       \
-                                                     \
-    last_zygote##abi = now;                          \
-                                                     \
-    return count_zygote##abi >= MAX_RETRY_COUNT;     \
+/* INFO: Tracks how often zygote restarts inside a short window.
+
+           The counter must never be the reason injection stops for good: a soft
+             reboot cycle can restart zygote several times in a row without
+             anything being wrong with the injection itself, and giving up on
+             those made the module stay dead until a full reboot.
+
+           Instead of a latch, the value decays: restarts that are far enough
+             apart clear it, and once the burst passes the limit the caller skips
+             that single restart and the next quiet period resets everything.
+*/
+#define CREATE_ZYGOTE_START_COUNTER(abi)              \
+  struct timespec last_zygote##abi = {                \
+    .tv_sec = 0,                                      \
+    .tv_nsec = 0                                      \
+  };                                                  \
+                                                      \
+  int count_zygote ## abi = 0;                        \
+  bool should_stop_inject ## abi() {                  \
+    struct timespec now = {};                         \
+    clock_gettime(CLOCK_MONOTONIC, &now);             \
+                                                      \
+    /* INFO: A zero timestamp means nothing has been recorded yet. Without     \
+               this check the very first call compares against the epoch and   \
+               always looks like a back-to-back restart. */                    \
+    bool first_call = last_zygote##abi.tv_sec == 0;                           \
+                                                      \
+    if (first_call || now.tv_sec - last_zygote ## abi.tv_sec >= 30) {         \
+      count_zygote ## abi = 0;                        \
+    } else {                                          \
+      count_zygote ## abi++;                          \
+    }                                                 \
+                                                      \
+    last_zygote##abi = now;                           \
+                                                      \
+    /* INFO: Past the burst limit this restart is skipped, but the counter is  \
+               reset so the next restart gets a fresh chance instead of        \
+               keeping the module from injecting until the next hard boot. */  \
+    if (count_zygote##abi >= MAX_RETRY_COUNT) {       \
+      LOGW("Zygote" #abi " restarted %d times in a row, skipping this one",    \
+           count_zygote##abi);                        \
+                                                      \
+      count_zygote ## abi = 0;                        \
+                                                      \
+      return true;                                    \
+    }                                                 \
+                                                      \
+    return false;                                     \
   }
 
 CREATE_ZYGOTE_START_COUNTER(64)
@@ -540,22 +570,21 @@ static bool ensure_daemon_created(bool is_64bit) {
     tracer = "./bin/zygisk-ptrace" # abi;                             \
     is_tango = false;                                                 \
                                                                       \
+    /* INFO: Skip only this restart, never the whole tracing session.        \
+               Detaching init here used to stop injection until the next hard \
+               reboot, so a burst of zygote restarts silently disabled the    \
+               module for the rest of the boot. */                            \
     if (should_stop_inject ## abi()) {                                \
-      LOGW("Zygote" # abi " restart too much times, stop injecting"); \
-                                                                      \
-      tracing_state = STOPPING;                                       \
-      monitor_stop_reason = "Zygote crashed";                         \
-      ptrace(PTRACE_INTERRUPT, 1, 0, 0);                              \
+      LOGW("Zygote" # abi " restarting too often, skipping this one");\
                                                                       \
       break;                                                          \
     }                                                                 \
                                                                       \
+    /* INFO: A daemon that is momentarily unavailable skips this restart     \
+               instead of ending the session; the SIGCHLD path now restarts    \
+               it, so the next zygote gets injected normally. */               \
     if (!ensure_daemon_created(is_64)) {                              \
-      LOGW("ReZygiskd " #abi "-bit not running, stop injecting");     \
-                                                                      \
-      tracing_state = STOPPING;                                       \
-      monitor_stop_reason = "NextZygiskd not running";                  \
-      ptrace(PTRACE_INTERRUPT, 1, 0, 0);                              \
+      LOGW("ReZygiskd " #abi "-bit not running, skipping this restart");\
                                                                       \
       break;                                                          \
     }                                                                 \
@@ -566,22 +595,15 @@ static bool ensure_daemon_created(bool is_64bit) {
     tracer = "./bin/zygisk-ptrace32";                              \
     is_tango = true;                                               \
                                                                    \
+    /* INFO: Same as the zygote path: skip this restart only. */     \
     if (should_stop_inject32()) {                                  \
-      LOGW("Tango restart too many times, stop injecting");        \
-                                                                   \
-      tracing_state = STOPPING;                                    \
-      monitor_stop_reason = "Zygote crashed";                      \
-      ptrace(PTRACE_INTERRUPT, 1, 0, 0);                           \
+      LOGW("Tango restarting too often, skipping this one");       \
                                                                    \
       break;                                                       \
     }                                                              \
                                                                    \
     if (!ensure_daemon_created(false)) {                           \
-      LOGW("ReZygiskd 32-bit not running, stop injecting");        \
-                                                                   \
-      tracing_state = STOPPING;                                    \
-      monitor_stop_reason = "NextZygiskd not running";               \
-      ptrace(PTRACE_INTERRUPT, 1, 0, 0);                           \
+      LOGW("ReZygiskd 32-bit not running, skipping this restart"); \
                                                                    \
       break;                                                       \
     }                                                              \
