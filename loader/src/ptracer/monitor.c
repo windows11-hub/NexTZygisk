@@ -1019,12 +1019,27 @@ void sigchld_listener_callback() {
           LOGW("process %d received unknown sigchld_status %s", pid, status_str);
         }
 
-        for (size_t i = 0; i < sigchld_process_count; i++) {
-          if (sigchld_process[i] != pid) continue;
+        /* INFO: Forget the slot only once the process is really gone.
 
-          sigchld_process[i] = 0;
+                 Clearing it on every event was wrong: a single stop (a signal,
+                   a fork, an exec of its own) removed the pid from this list, so
+                   the next event for the same pid looked like a brand new
+                   process. That path only arms PTRACE_O_TRACEEXEC and continues,
+                   which silently skipped the injection block above - a zygote
+                   that hit a stop before its exec came up without injection and
+                   without a single error line.
 
-          break;
+                 WIFEXITED/WIFSIGNALED is the only case where the pid is free to
+                   be reused, so it is the only case that may release the slot.
+        */
+        if (WIFEXITED(sigchld_status) || WIFSIGNALED(sigchld_status)) {
+          for (size_t i = 0; i < sigchld_process_count; i++) {
+            if (sigchld_process[i] != pid) continue;
+
+            sigchld_process[i] = 0;
+
+            break;
+          }
         }
 
         if (WIFSTOPPED(sigchld_status)) {
