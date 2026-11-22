@@ -836,43 +836,6 @@ static bool is_custom_umount_target(const char *target, char **paths, size_t cou
   return false;
 }
 
-/* INFO: Mounts that must never be detached, even when they look like root
-           mounts.
-
-           umount2(MNT_DETACH) removes the whole subtree under the target, not
-             just that one mount. On ColorOS the storage tree
-             (/mnt/runtime, /storage/emulated, /mnt/user and their children) is
-             built inside the same namespace, and several of its entries carry a
-             source or root that matches the root-solution check below. Detaching
-             any of them tore down the storage subtree, which shows up as the
-             storage manager and file manager losing their view of external
-             storage.
-
-           These prefixes cover the storage tree and the system mounts a process
-             cannot survive without. Everything else is still unmounted, so the
-             root unmount feature keeps working.
-*/
-static const char *const protected_mount_prefixes[] = {
-  "/mnt/runtime", "/mnt/user", "/mnt/expand", "/storage",
-  "/mnt/media_rw", "/mnt/pass_through", "/mnt/installer",
-  "/system", "/vendor", "/product", "/system_ext", "/odm", "/apex",
-  "/data/user", "/data/user_de", "/data/data", "/data/media"
-};
-
-static bool is_protected_mount(const char *target) {
-  for (size_t i = 0; i < sizeof(protected_mount_prefixes) / sizeof(protected_mount_prefixes[0]); i++) {
-    size_t len = strlen(protected_mount_prefixes[i]);
-
-    if (strncmp(target, protected_mount_prefixes[i], len) != 0) continue;
-
-    /* INFO: Require a path boundary so "/storage" does not also match
-               "/storageX". */
-    if (target[len] == '\0' || target[len] == '/') return true;
-  }
-
-  return false;
-}
-
 bool umount_root(struct root_impl impl) {
   /* INFO: We are already in the target pid mount namespace, so actually,
              when we use self here, we meant its pid.
@@ -907,14 +870,6 @@ bool umount_root(struct root_impl impl) {
     if (num_custom > 0 && is_custom_umount_target(mount.target, custom_paths, num_custom)) should_unmount = true;
 
     if (!should_unmount) continue;
-
-    /* INFO: Never detach storage or system mounts - the subtree would go with
-               them and the process would lose its external storage view. */
-    if (is_protected_mount(mount.target)) {
-      LOGI("[%s] Skipping protected mount %s", source_name, mount.target);
-
-      continue;
-    }
 
     char **tmp_targets = realloc(targets_to_unmount, (num_targets + 1) * sizeof(char*));
     if (tmp_targets == NULL) {
@@ -955,56 +910,100 @@ bool umount_root(struct root_impl impl) {
   return true;
 }
 
-/* INFO: A saved namespace is only usable for apps if it still contains the
-           external storage mounts.
 
-           The Mounted snapshot is captured from whichever process asks first. On
-             ColorOS that first process can still be missing the per-user storage
-             binds, which are only installed inside mount_external() during
-             postAppSpecialize. A snapshot taken before that point has no
-             /mnt/user or /storage entries at all, and every app that later setns
-             into it loses its view of external storage for good - the "storage
-             temporarily unavailable" breakage.
+/* INFO: The captured namespaces, kept here so a restart can drop them.
 
-           Rather than trusting the captured namespace, check for the storage
-             mountpoints and treat a snapshot without them as unusable, so the
-             caller falls back to the process' own namespace.
+           ReZygiskd survives a soft reboot, but the namespaces it captured do not:
+             zygote is restarted and every mount tree is rebuilt. Reusing a fd from
+             the previous boot put the next process into a mount tree whose
+             per-user and /data/app mounts no longer exist, so it could not load its
+             own dex and resources - the System UI crash that followed a soft
+             reboot.
 */
-/* INFO: True when the CURRENT mount namespace carries the external storage
-           mounts.
+static int clean_namespace_fd = -1;
+static int mounted_namespace_fd = -1;
 
-           This must run inside the child that already called setns(): the mount
-             table is a property of the namespace the thread is in, and a
-             namespace fd is not a directory, so /proc/self/fd/<fd>/mountinfo
-             cannot be used to peek at it from outside.
+/* INFO: The zygote the captured namespaces belong to.
+
+           Every request comes from a process zygote forked, so its parent is the
+             zygote that owns the mount tree the request is about. A different parent
+             means zygote was replaced - a soft reboot restarts it - and the captured
+             fds then describe mounts that no longer exist.
 */
-static bool namespace_has_external_storage(void) {
-  FILE *mountinfo = fopen("/proc/self/mountinfo", "r");
-  if (!mountinfo) return false;
+static pid_t captured_zygote_pid = -1;
 
-  bool has_user = false;
-  bool has_storage = false;
+/* INFO: The zygote a pid belongs to, or -1 when it cannot be read.
 
-  char line[PATH_MAX];
-  while (fgets(line, sizeof(line), mountinfo)) {
-    if (strstr(line, " /mnt/user") || strstr(line, " /mnt/runtime")) has_user = true;
-    if (strstr(line, " /storage/")) has_storage = true;
+           Only the direct parent is used: zygote forks the requesting process, so the
+             parent is exactly the process whose namespace was captured.
+*/
+static pid_t parent_of(int pid) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "/proc/%d/stat", pid);
 
-    if (has_user && has_storage) break;
+  FILE *stat = fopen(path, "r");
+  if (!stat) return -1;
+
+  /* INFO: The comm field is parenthesized and may contain spaces and parentheses,
+             so the fields after it are parsed from the last ')'. */
+  char line[512];
+  if (!fgets(line, sizeof(line), stat)) {
+    fclose(stat);
+
+    return -1;
   }
 
-  fclose(mountinfo);
+  fclose(stat);
 
-  return has_user && has_storage;
+  char *close_paren = strrchr(line, ')');
+  if (!close_paren) return -1;
+
+  /* INFO: After ')', the next field is the state, then ppid. */
+  char state = 0;
+  int ppid = -1;
+  if (sscanf(close_paren + 1, " %c %d", &state, &ppid) != 2) return -1;
+
+  return (pid_t)ppid;
+}
+
+void save_mns_fd_reset(void) {
+  if (clean_namespace_fd != -1) {
+    close(clean_namespace_fd);
+
+    clean_namespace_fd = -1;
+  }
+
+  if (mounted_namespace_fd != -1) {
+    close(mounted_namespace_fd);
+
+    mounted_namespace_fd = -1;
+  }
+
+  captured_zygote_pid = -1;
+
+  LOGI("Dropped captured mount namespaces");
 }
 
 int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl impl) {
-  static int clean_namespace_fd = -1;
-  static int mounted_namespace_fd = -1;
 
-  /* INFO: Cached namespaces are only stored after the child proved they carry
-             the external storage mounts, so a cached entry is safe to hand out
-             directly. */
+  /* INFO: Whatever was captured before belongs to one zygote. When the requesting
+             process comes from a different one, zygote was replaced - a soft reboot
+             does exactly that - and the captured namespaces describe mounts that no
+             longer exist. Reusing them put the next process into a tree whose
+             per-user and /data/app mounts were gone, which is what kept System UI
+             from loading its own dex after a soft reboot.
+  */
+  pid_t zygote = parent_of(pid);
+
+  if (zygote > 1 && captured_zygote_pid > 1 && zygote != captured_zygote_pid) {
+    LOGW("Zygote changed (%d -> %d), dropping captured mount namespaces",
+         captured_zygote_pid, zygote);
+
+    save_mns_fd_reset();
+  }
+
+  if (zygote > 1 && captured_zygote_pid <= 1) captured_zygote_pid = zygote;
+
   if (mns_state == Clean && clean_namespace_fd != -1) return clean_namespace_fd;
   if (mns_state == Mounted && mounted_namespace_fd != -1) return mounted_namespace_fd;
 
@@ -1063,14 +1062,6 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
       _exit(1);
     }
 
-    /* INFO: Tell the parent whether this namespace is actually usable by apps.
-               A snapshot taken before the per-user storage binds existed has no
-               /mnt/user or /storage entries, and caching it would starve every
-               app that later setns into it. */
-    uint8_t has_storage = namespace_has_external_storage() ? 1 : 0;
-    if (write_uint8_t(socket_child, has_storage) == -1)
-      LOGE("Failed to write storage flag to socket_child: %s", strerror(errno));
-
     uint8_t has_opened = 0;
     if (read_uint8_t(socket_child, &has_opened) == -1)
       LOGE("Failed to read from socket_child: %s", strerror(errno));
@@ -1098,15 +1089,6 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
     close(socket_parent);
 
     return -1;
-  }
-
-  /* INFO: Whether the child's namespace carries the external storage mounts.
-             Used below to decide if this snapshot may be cached for reuse. */
-  uint8_t has_storage = 0;
-  if (read_uint8_t(socket_parent, &has_storage) == -1) {
-    LOGE("Failed to read storage flag from socket_parent: %s", strerror(errno));
-
-    has_storage = 0;
   }
 
   char ns_path[PATH_MAX];
@@ -1145,22 +1127,8 @@ int save_mns_fd(int pid, enum MountNamespaceState mns_state, struct root_impl im
     return -1;
   }
 
-  /* INFO: Only cache a namespace that apps can actually use. A Mounted snapshot
-             captured before the storage binds existed would starve every app
-             that setns into it, so it is validated first; an unusable one is
-             returned to the caller for this request but never reused.
-  */
-  /* INFO: Cache only namespaces the child proved to carry external storage.
-             A snapshot captured before those binds existed is still returned for
-             this one request, but is never reused - otherwise every later app
-             would inherit a namespace without /mnt/user and /storage. */
-  if (!has_storage) {
-    LOGW("Namespace has no external storage mounts yet, not caching it for reuse");
-  } else if (mns_state == Clean) {
-    clean_namespace_fd = ns_fd;
-  } else if (mns_state == Mounted) {
-    mounted_namespace_fd = ns_fd;
-  }
+  if (mns_state == Clean) clean_namespace_fd = ns_fd;
+  else if (mns_state == Mounted) mounted_namespace_fd = ns_fd;
 
   return ns_fd;
 }
