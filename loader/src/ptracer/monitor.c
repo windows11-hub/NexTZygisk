@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 #include "daemon.h"
 #include "socket_utils.h"
